@@ -5,9 +5,9 @@ description: Apply or resume an AsmEvo-style correctness-gated optimization loop
 
 # AsmEvo
 
-Run a profiling-guided optimization loop in which deterministic gates, not the
-model, decide correctness and performance. Treat the original implementation or
-binary as immutable evidence.
+Run a profiling-guided optimization loop in which an executable controller, not
+the model, orders correctness and performance work. Treat the original
+implementation or binary as hash-bound, tamper-detected evidence.
 
 This skill extracts the reusable workflow from the AsmEvo paper. It does not
 pretend to provide a universal HSACO rewriter or dispatch-capture runtime. Use a
@@ -16,17 +16,24 @@ project's existing build, launch, profiling, and comparison tools when present.
 ## Non-negotiable trust boundary
 
 - The agent may analyze, propose, and apply localized candidate edits.
-- Deterministic tools own build validity, ABI/resource checks, functional
-  equivalence, timing, and commit decisions.
+- `scripts/controller.py` owns adapter invocation, gate order, correctness
+  receipts, timing authorization, and lineage submission.
+- Authorized deterministic adapters own build validity, ABI/resource checks,
+  functional equivalence, and hardware timing.
 - Never accept correctness from code inspection, model judgment, or a candidate's
   own self-report.
 - Never time a candidate before it passes the required correctness gates.
 - Never overwrite the original artifact or continue from an unverified candidate.
 - Never report an optimization unless fresh measurements show that the configured
   acceptance threshold was met.
-- The helpers validate evidence structure and promotion arithmetic; they do not
-  authenticate measurements. Require raw evidence from the authorized oracle and
-  benchmark adapters, not values manually asserted by the agent.
+- `gate.py` and `lineage.py` remain low-level interfaces. Caller-supplied
+  evaluation JSON is not controller-backed evidence and must not support an
+  empirical optimization claim.
+- For cooperative public-CLI use, the controller enforces invocation order and
+  binds bytes. Its module-private token prevents accidental low-level bypass, not
+  a same-user caller that can import Python. It also does not authenticate a
+  malicious adapter, operating system, GPU, or remote worker. These remain in the
+  trusted computing base.
 
 ## Select the operating mode
 
@@ -49,7 +56,7 @@ which oracle is authoritative, and which guarantees are unavailable.
 
 Establish the following before searching:
 
-- target artifact and immutable SHA-256 identity;
+- target artifact and tamper-detected SHA-256 identity;
 - target GPU architecture and wave mode, independently detected rather than
   inferred from the presence of a device node;
 - compiler, ROCm, driver, and code-object versions where observable;
@@ -60,13 +67,12 @@ Establish the following before searching:
 - profiler or static evidence used to select the first hot window;
 - writable private run directory that is not a published artifact directory.
 
-Use `scripts/preflight.py` to record artifact identity, required executable
-availability, and the architecture reported by an independent GPU inventory
-tool. Pass that reported value with `--detected-arch`; `/dev/dxg`, `/dev/kfd`, or
-a render node alone does not prove the requested architecture. If the project
-lacks a command contract, read
-[references/adapter-contract.md](references/adapter-contract.md) and create the
-smallest project-local adapter needed for the requested run.
+Use `scripts/preflight.py` to record artifact identity, resolved adapter paths and
+hashes, and the architecture reported by an independent GPU inventory tool. Pass
+that reported value with `--detected-arch`; `/dev/dxg`, `/dev/kfd`, or a render
+node alone does not prove the requested architecture. If the project lacks a
+command contract, read [references/adapter-contract.md](references/adapter-contract.md)
+and create the smallest project-local adapter needed for the requested run.
 
 For real-dispatch captures, treat kernargs and device-memory snapshots as sensitive
 data. Keep them in an authorized private workspace and never commit them.
@@ -77,15 +83,18 @@ data. Keep them in an authorized private workspace and never commit them.
    mode, target architecture, environment identity, ordered cases, comparison
    rules, and performance thresholds before evaluating candidates.
 2. Freeze the original artifact as `K0`; record its content hash.
-3. Run the oracle on every frozen case before changing code.
-4. Record raw baseline timing samples after warmup. Do not retain only a summary.
-5. In binary mode, prove no-edit round-trip fidelity before attempting an edit.
-6. Initialize a verified lineage with
-   `scripts/lineage.py init --contract ... --preflight ...
-   --environment-manifest ...`. Initialization must reject a blocked, mismatched,
-   or incomplete preflight report or an environment-manifest hash mismatch.
-7. Capture the full environment manifest next to the run evidence and bind its
+3. Capture the full environment manifest next to the run evidence and bind its
    identity in the frozen contract.
+4. Initialize only through `scripts/controller.py init`. It directly runs the
+   source oracle, or the binary recover/rebuild/round-trip/static/oracle/replay/
+   compare chain, mints a correctness receipt, and only then invokes the baseline
+   benchmark.
+5. Confirm the resulting lineage reports `record_policy: controller-v1` and
+   preserves raw baseline timing samples. Do not use the legacy
+   `lineage.py init --baseline-median-ms` path for a measured claim.
+
+Read [references/controller-contract.md](references/controller-contract.md) for
+the exact state machine and commands.
 
 If the baseline is incorrect, unstable, or cannot round-trip, stop optimization and
 report that failure. The search cannot repair an untrusted baseline.
@@ -101,21 +110,18 @@ Repeat within the user's time or attempt budget:
    only for the observed bottleneck class.
 4. Create one localized candidate edit. Preserve a clean diff against its verified
    parent and record the rationale.
-5. Build or rebuild the complete kernel artifact.
-6. Run gates in this exact order:
-   - assembly/build validity;
-   - ABI, descriptor, metadata, and resource consistency when applicable;
-   - functional equivalence for every configured case, including guards;
-   - warmup and stable timing under the same launch conditions;
-   - variance-aware improvement threshold against the current verified best.
-7. Materialize the evidence in the format described by
-   [references/acceptance-contract.md](references/acceptance-contract.md), then run
-   `scripts/gate.py`.
-8. Pass the original evaluation JSON—not an editable decision—to
-   `scripts/lineage.py record --evaluation ...`. The lineage helper reruns the
-   deterministic gate; only accepted candidates become verified lineage nodes.
-9. Re-profile after an accepted edit. On rejection, reset fully to a verified node
-   before trying another direction.
+5. Submit only the proposal and descriptive edit metadata to
+   `scripts/controller.py evaluate`. Never assemble an evaluation JSON or pass
+   correctness/timing values from the model.
+6. Let the controller run build/rebuild, mandatory binary static checks, and every
+   frozen correctness case. It writes a hash-bound correctness receipt before it
+   can spawn the benchmark adapter.
+7. Let the controller re-hash frozen inputs and the candidate before and after
+   timing, run the deterministic verdict, and atomically record the attempt.
+8. Distinguish branch acceptance from global-best promotion. A candidate may be a
+   verified branch node while `best_id` remains a faster node from another branch.
+9. Re-profile after an accepted edit. On rejection, start the next proposal from a
+   verified node rather than from rejected bytes.
 
 Prefer many small, attributable edits over a large rewrite. Stop repeating a
 direction after the same failure signature recurs; summarize the exhausted
@@ -125,12 +131,12 @@ hypothesis and redirect to a different bottleneck.
 
 Use parallel workers only when they have isolated workspaces, separate candidate
 identities, and non-conflicting GPU allocation. Use one shared lineage state only
-through `lineage.py`, whose record operation is file-locked. Assign orthogonal directions such
-as latency hiding, dependency reduction, register-pressure control, memory access,
-or instruction simplification.
+through the controller; its final lineage record is file-locked. Assign orthogonal
+directions such as latency hiding, dependency reduction, register-pressure
+control, memory access, or instruction simplification.
 
-Start every worker from a verified node. Treat worker results as untrusted until
-the controller runs the full gate. When combining successful edits:
+Start every worker from a controller-bound node. Treat worker proposals as
+untrusted until the controller runs the full gate. When combining successful edits:
 
 - require a common verified base;
 - prefer disjoint or clearly complementary edit windows;
@@ -156,6 +162,8 @@ An optimization result is complete only when the user receives:
 - original and optimized artifact identities;
 - operating mode and oracle description;
 - frozen workload-contract, preflight-report, and environment-manifest SHA-256s;
+- baseline and per-candidate correctness-receipt SHA-256s;
+- adapter executable identities and ordered phase evidence;
 - exact build, verification, and benchmark commands;
 - evaluated shapes, dtypes, strides, seeds, and launch configurations;
 - ABI/resource comparison where applicable;

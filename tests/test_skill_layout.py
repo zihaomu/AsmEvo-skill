@@ -22,11 +22,13 @@ class SkillLayoutTests(unittest.TestCase):
             "VERSION",
             "agents/openai.yaml",
             "scripts/gate.py",
+            "scripts/controller.py",
             "scripts/lineage.py",
             "scripts/preflight.py",
             "references/acceptance-contract.md",
             "references/adapter-contract.md",
             "references/binary-backend.md",
+            "references/controller-contract.md",
             "references/failure-taxonomy.md",
             "references/optimization-playbook.md",
             "assets/evaluation-template.json",
@@ -74,6 +76,14 @@ class SkillLayoutTests(unittest.TestCase):
         self.assertIn('display_name: "AsmEvo"', contents)
         self.assertIn("$asmevo", contents)
 
+    def test_release_versions_match_and_controller_is_executable(self) -> None:
+        root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        skill_version = (SKILL / "VERSION").read_text(encoding="utf-8").strip()
+
+        self.assertEqual(root_version, "0.2.0.0")
+        self.assertEqual(skill_version, root_version)
+        self.assertTrue((SKILL / "scripts" / "controller.py").stat().st_mode & 0o111)
+
     def test_evaluation_example_binds_its_environment_manifest(self) -> None:
         evaluation = json.loads(
             (SKILL / "assets" / "evaluation-template.json").read_text(encoding="utf-8")
@@ -111,10 +121,21 @@ class SkillLayoutTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
+            controller_help = subprocess.run(
+                [
+                    sys.executable,
+                    str(installed / "scripts" / "controller.py"),
+                    "--help",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
 
         self.assertEqual(gate_result.returncode, 0, gate_result.stderr)
         self.assertTrue(json.loads(gate_result.stdout)["accepted"])
         self.assertEqual(lineage_help.returncode, 0, lineage_help.stderr)
+        self.assertEqual(controller_help.returncode, 0, controller_help.stderr)
         self.assertEqual(
             (SKILL / "LICENSE.txt").read_bytes(), (ROOT / "LICENSE").read_bytes()
         )

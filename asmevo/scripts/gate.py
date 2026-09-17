@@ -9,13 +9,25 @@ import json
 import math
 import statistics
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 class GateInputError(ValueError):
     """Raised when evaluation evidence is incomplete or malformed."""
+
+
+def _reject_constant(value: str) -> None:
+    raise GateInputError(f"non-finite JSON number is forbidden: {value}")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise GateInputError(f"duplicate JSON key: {key}")
+        document[key] = value
+    return document
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -70,7 +82,12 @@ def _summary(samples: list[float]) -> dict[str, float | int]:
 
 
 def _digest(document: dict[str, Any]) -> str:
-    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    try:
+        canonical = json.dumps(
+            document, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError) as error:
+        raise GateInputError(f"evaluation is not canonical JSON: {error}") from error
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -122,6 +139,20 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     require_guards = equivalence.get("require_guards_intact", True)
     if not isinstance(require_integer, bool) or not isinstance(require_guards, bool):
         raise GateInputError("equivalence policy boolean values must be boolean")
+    raw_exact_only = equivalence.get("exact_only_case_ids", [])
+    if not isinstance(raw_exact_only, list) or not all(
+        isinstance(case_id, str) and case_id.strip() for case_id in raw_exact_only
+    ):
+        raise GateInputError("exact_only_case_ids must be an array of case IDs")
+    exact_only_case_ids = [case_id.strip() for case_id in raw_exact_only]
+    if len(exact_only_case_ids) != len(set(exact_only_case_ids)):
+        raise GateInputError("exact_only_case_ids must be unique")
+    unknown_exact_only = sorted(set(exact_only_case_ids) - set(case_ids))
+    if unknown_exact_only:
+        raise GateInputError(
+            "exact_only_case_ids are absent from contract.case_ids: "
+            + ", ".join(unknown_exact_only)
+        )
 
     performance = _mapping(
         contract.get("performance_policy"), "contract.performance_policy"
@@ -168,6 +199,7 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         "max_absolute_error": max_error,
         "require_integer_exact": require_integer,
         "require_guards_intact": require_guards,
+        "exact_only_case_ids": exact_only_case_ids,
         "minimum_samples": minimum_samples,
         "minimum_relative_improvement": minimum_improvement,
         "cv_multiplier": cv_multiplier,
@@ -209,7 +241,6 @@ def _base_decision(
         "reasons": [],
         "metrics": {},
         "evidence_sha256": _digest(document),
-        "evaluated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -273,6 +304,14 @@ def evaluate(document: dict[str, Any]) -> dict[str, Any]:
         float_applicable = case.get("float_metrics_applicable", True)
         if not isinstance(float_applicable, bool):
             raise GateInputError(f"{case_id}.float_metrics_applicable must be boolean")
+        expected_float_applicable = (
+            case_id not in contract_values["exact_only_case_ids"]
+        )
+        if float_applicable != expected_float_applicable:
+            raise GateInputError(
+                f"{case_id}.float_metrics_applicable does not match the frozen "
+                "exact_only_case_ids policy"
+            )
         if float_applicable:
             cosine = _number(
                 case.get("cosine_similarity"), f"{case_id}.cosine_similarity"
@@ -280,6 +319,12 @@ def evaluate(document: dict[str, Any]) -> dict[str, Any]:
             absolute_error = _number(
                 case.get("max_absolute_error"), f"{case_id}.max_absolute_error"
             )
+            if not -1.0 <= cosine <= 1.0:
+                raise GateInputError(f"{case_id}.cosine_similarity must be in [-1, 1]")
+            if absolute_error < 0:
+                raise GateInputError(
+                    f"{case_id}.max_absolute_error must be non-negative"
+                )
             if cosine < contract_values["min_cosine_similarity"]:
                 divergence.append(
                     f"{case_id}: cosine similarity {cosine} < "
@@ -410,7 +455,8 @@ def evaluate(document: dict[str, Any]) -> dict[str, Any]:
 def _write_json(path: Path, document: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -421,7 +467,11 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        document = json.loads(args.evaluation.read_text(encoding="utf-8"))
+        document = json.loads(
+            args.evaluation.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
         if not isinstance(document, dict):
             raise GateInputError("evaluation root must be an object")
         decision = evaluate(document)

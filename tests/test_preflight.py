@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -69,6 +70,7 @@ class PreflightTests(unittest.TestCase):
             adapter = directory / "adapter"
             adapter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             adapter.chmod(adapter.stat().st_mode | 0o111)
+            adapter_digest = hashlib.sha256(adapter.read_bytes()).hexdigest()
             capabilities = {
                 "build": str(adapter),
                 "oracle": str(adapter),
@@ -89,6 +91,12 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(len(report["artifact"]["sha256"]), 64)
         self.assertTrue(
             all(item["resolved"] for item in report["capabilities"].values())
+        )
+        self.assertTrue(
+            all(
+                item["sha256"] == adapter_digest
+                for item in report["capabilities"].values()
+            )
         )
 
     def test_non_executable_path_does_not_satisfy_capability(self) -> None:

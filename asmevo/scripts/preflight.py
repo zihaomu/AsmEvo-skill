@@ -56,7 +56,26 @@ def _resolve_executable(value: str) -> str | None:
         if path.is_file() and os.access(path, os.X_OK):
             return str(path)
         return None
-    return shutil.which(value)
+    resolved = shutil.which(value)
+    return str(Path(resolved).resolve()) if resolved else None
+
+
+def _capability_identity(requested: str) -> dict[str, Any]:
+    resolved = _resolve_executable(requested)
+    if resolved is None:
+        return {
+            "requested": requested,
+            "resolved": None,
+            "sha256": None,
+            "size_bytes": None,
+        }
+    path = Path(resolved)
+    return {
+        "requested": requested,
+        "resolved": resolved,
+        "sha256": _sha256(path),
+        "size_bytes": path.stat().st_size,
+    }
 
 
 def inspect(
@@ -84,10 +103,14 @@ def inspect(
     normalized_target_arch = (
         target_arch.strip() if isinstance(target_arch, str) else None
     )
-    resolved = {
-        name: _resolve_executable(value) for name, value in capabilities.items()
+    capability_identities = {
+        name: _capability_identity(value) for name, value in capabilities.items()
     }
-    missing_capabilities = sorted(name for name in required if not resolved.get(name))
+    missing_capabilities = sorted(
+        name
+        for name in required
+        if not capability_identities.get(name, {}).get("resolved")
+    )
 
     artifact_info: dict[str, Any] | None = None
     failures: list[str] = []
@@ -149,8 +172,7 @@ def inspect(
         "artifact": artifact_info,
         "target_arch": normalized_target_arch,
         "capabilities": {
-            name: {"requested": capabilities[name], "resolved": resolved[name]}
-            for name in sorted(capabilities)
+            name: capability_identities[name] for name in sorted(capabilities)
         },
         "required_capabilities": sorted(required),
         "gpu": {

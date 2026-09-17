@@ -1,90 +1,125 @@
 # Project adapter contract
 
-The skill orchestrates project-specific commands; it does not assume one build
-system or benchmark framework. Prefer existing project commands. Add wrapper
-executables only when the project has no stable interface.
+The skill supplies the controller, not a universal compiler, replay harness, or
+profiler. Project adapters form the trusted measurement boundary. Keep them small,
+directly executable, deterministic where possible, and independently reviewed.
 
-## Capability wrappers
+## Capability set
 
-Each wrapper should be a directly executable file or a command already available
-on `PATH`. Avoid shell command strings embedded in JSON. A wrapper owns its working
-directory, environment setup, timeouts, and tool-specific flags.
+Source mode requires `build`, `oracle`, and `benchmark`.
 
-Source mode requires:
-
-- `build`: produce one candidate artifact from the edited source;
-- `oracle`: compare the candidate with the independent reference over the frozen
-  case set and emit machine-readable evidence;
-- `benchmark`: emit raw baseline, parent, and candidate latency samples.
-
-Binary mode additionally requires every capability listed in
+Binary mode requires `recover`, `roundtrip`, `rebuild`, `static_check`, `oracle`,
+`replay`, `compare`, and `benchmark`. Their semantic duties are described in
 [binary-backend.md](binary-backend.md).
 
-Run the installed skill's `scripts/preflight.py` by absolute path, with one
-`--capability NAME=EXECUTABLE` argument per capability. Example:
+Register every adapter with `scripts/preflight.py` as `NAME=EXECUTABLE`. Preflight
+resolves the absolute real path and records its executable SHA-256 and size. The
+controller re-hashes every required adapter before each run and after each
+invocation. Changing a wrapper requires a new preflight, baseline, and lineage.
 
-```bash
-ASMEVO_SKILL_ROOT="${CODEX_HOME:-${HOME}/.codex}/skills/asmevo"
-python3 "$ASMEVO_SKILL_ROOT/scripts/preflight.py" \
-  --mode source \
-  --artifact build/original.hsaco \
-  --target-arch gfx942 \
-  --detected-arch gfx942 \
-  --require-gpu \
-  --capability build=./tools/build-candidate \
-  --capability oracle=./tools/check-candidate \
-  --capability benchmark=./tools/benchmark-candidate \
-  --output run/preflight.json
+## Invocation ABI
+
+The controller invokes an adapter without a shell:
+
+```text
+/absolute/path/to/adapter --request /absolute/path/to/request.json
 ```
 
-`ASMEVO_SKILL_ROOT` must be the absolute directory containing this skill's
-`SKILL.md`. When developing from a checkout, point it at that checkout's `asmevo/`
-directory instead. Keep artifact and run paths relative to the target project.
+The adapter must write exactly one UTF-8 JSON object to stdout and diagnostics to
+stderr. It must not add banners or log lines to stdout. Exit zero plus `"ok": true`
+means the requested phase completed; every other outcome fails closed.
 
-The preflight resolves executables but does not run them. Obtain each
-`--detected-arch` value from an independent inventory tool such as the project's
-validated `rocminfo` parser; never copy the requested target into this field by
-assumption. A device node alone is not architecture evidence. Binary mode fails
-closed when the target architecture is not confirmed or any mandatory capability
-is missing. Source and binary modes always require a matching `--detected-arch`;
-`--require-gpu` additionally requires a local device node and is useful when the
-adapters are not executing against an authorized remote worker.
+The common request envelope is:
 
-## Evidence rules
+```json
+{
+  "schema_version": 1,
+  "protocol": "asmevo.adapter.v1",
+  "request_id": "random-128-bit-hex",
+  "operation": "build",
+  "purpose": "candidate",
+  "binding": {
+    "mode": "source",
+    "target_arch": "gfx942",
+    "candidate_id": "c001",
+    "parent_id": "K0",
+    "original_id": "K0",
+    "contract_sha256": "...",
+    "environment_sha256": "...",
+    "preflight_sha256": "...",
+    "original_sha256": "...",
+    "parent_sha256": "...",
+    "proposal_sha256": "...",
+    "candidate_sha256": null,
+    "case_ids": ["m1024-n1024-k1024-fp16-seed0"],
+    "correctness_receipt_sha256": null
+  },
+  "contract": {"path": "/private/run/contract.json", "case_ids": ["..."]},
+  "artifacts": {"original": {"path": "...", "sha256": "..."}},
+  "inputs": {},
+  "outputs": {"candidate_artifact": "/private/run/attempts/c001/artifacts/candidate.hsaco"},
+  "attempt_directory": "/private/run/attempts/c001"
+}
+```
 
-Wrappers should write files into a candidate-specific run directory and print a
-small JSON summary to stdout. Preserve full logs separately. Every summary should
-contain:
+The common response envelope is:
 
-- schema version;
-- candidate and parent IDs;
-- canonical proposal SHA-256 and final artifact SHA-256 when a build succeeds;
-- start/end timestamps and exit status;
-- exact cases or launch IDs evaluated;
-- frozen workload-contract SHA-256;
-- paths to raw logs and machine-readable results;
-- environment fingerprint or reference to it.
+```json
+{
+  "schema_version": 1,
+  "protocol": "asmevo.adapter.v1",
+  "request_id": "random-128-bit-hex",
+  "operation": "build",
+  "binding": {},
+  "ok": true,
+  "candidate_sha256": "..."
+}
+```
 
-The oracle wrapper, not the agent, computes numeric errors and exact-state checks.
-The benchmark wrapper, not the agent, captures event timings and synchronizes the
-device.
+`request_id`, `operation`, and the entire `binding` object must exactly echo the
+request. The controller computes every output hash itself and compares it with the
+adapter declaration. It never accepts an adapter-selected output path.
 
-## Source-mode integration
+## Operation results
 
-For a project such as `radeon-kernels`, reuse the existing high-level reference
-and compilation path, but keep promotion separate from “fastest observed median.”
-Convert raw timing samples into the gate input and apply the configured stability
-and improvement policy before updating the verified lineage.
+- `build` and `rebuild` write `outputs.candidate_artifact` and return its
+  `candidate_sha256`.
+- `recover` writes `outputs.recovered` and returns `output_sha256`.
+- `roundtrip` and `static_check` return the common envelope; `ok` is the verdict.
+- A binary `oracle` or `replay` writes `outputs.observations` and returns
+  `output_sha256`.
+- A source `oracle`, and binary `compare`, return `equivalence.cases` in the exact
+  ordered form consumed by `gate.py`.
+- A baseline `benchmark` returns `samples_ms`, including all post-warmup K0 samples.
+- A candidate `benchmark` returns `timing` with fresh `original_ms`, `parent_ms`,
+  and `candidate_ms` arrays. Its request has a non-null
+  `correctness_receipt_sha256` and includes the matching receipt path and hash.
 
-Source mode is AsmEvo-inspired optimization. It is not the paper's source-free
-binary setting, even when the compiled ISA is inspected after each source edit.
+All correctness responses must cover the frozen case IDs in the same order. The
+adapter computes numeric error, exact-state, and guard results. The contract's
+`exact_only_case_ids` is the only way to declare a case without floating metrics;
+the response cannot downgrade that requirement.
 
-## Command safety
+## Working directory and evidence
 
-- Treat every candidate as untrusted code.
-- Use a bounded timeout for build, correctness, and benchmark commands.
-- Run production dispatch capture only with explicit authorization for the target
-  application and data.
-- Do not pass secrets through command-line arguments or commit capture data.
-- Allocate a unique workspace and GPU lease per parallel worker.
-- Preserve failed logs; never discard failures or retain only the fastest run.
+The controller runs the wrapper from the candidate attempt directory and passes
+absolute paths. A wrapper must establish any project build directory, environment,
+GPU lease, synchronization, warmup, and tool-specific timeout it needs.
+
+The controller preserves the exact request, stdout, and stderr for each phase and
+hashes all three. Large tool logs should be written beneath the attempt directory
+and summarized on stderr; stdout and stderr are capped by the controller's
+`--max-output-bytes` setting.
+
+## Safety and scope
+
+- Treat candidate code as untrusted.
+- Do not pass secrets through arguments or stdout.
+- Keep captured kernargs, memory, model weights, prompts, and user data in an
+  authorized private run directory excluded from version control.
+- Use a unique workspace and GPU lease per parallel worker.
+- Version 1 is a local-file protocol. A remote worker needs content-addressed
+  transfer and a separately authenticated receipt; returning local-looking paths
+  from a remote service is not sufficient.
+- A script hash does not bind its shebang interpreter, shared libraries, driver,
+  or device firmware. Record those in the environment manifest.
