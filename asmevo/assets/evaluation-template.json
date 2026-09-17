@@ -17,7 +17,8 @@
       "min_cosine_similarity": 0.9999,
       "max_absolute_error": 0.001,
       "require_integer_exact": true,
-      "require_guards_intact": true
+      "require_guards_intact": true,
+      "exact_only_case_ids": []
     },
     "performance_policy": {
       "minimum_samples": 5,

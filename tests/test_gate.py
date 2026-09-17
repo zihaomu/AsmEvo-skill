@@ -93,6 +93,18 @@ class GateTests(unittest.TestCase):
         self.assertEqual(decision["status"], "divergent")
         self.assertEqual(decision["metrics"], {})
 
+    def test_float_metric_applicability_is_frozen_by_contract(self) -> None:
+        document = evaluation()
+        case_id = document["contract"]["case_ids"][0]
+        document["equivalence"]["cases"][0]["float_metrics_applicable"] = False
+
+        with self.assertRaisesRegex(gate.GateInputError, "exact_only_case_ids"):
+            gate.evaluate(document)
+
+        document["contract"]["equivalence_policy"]["exact_only_case_ids"] = [case_id]
+        decision = gate.evaluate(document)
+        self.assertTrue(decision["accepted"])
+
     def test_harness_can_invalidate_timing(self) -> None:
         document = evaluation()
         document["timing"] = {
@@ -131,10 +143,23 @@ class GateTests(unittest.TestCase):
 
         self.assertEqual(document, before)
 
+    def test_decision_is_deterministic_for_fixed_evidence(self) -> None:
+        document = evaluation()
+
+        first = gate.evaluate(document)
+        second = gate.evaluate(document)
+
+        self.assertEqual(first, second)
+
     def test_rejects_audit_mode_and_bad_samples(self) -> None:
         document = evaluation()
         document["mode"] = "audit"
         with self.assertRaises(gate.GateInputError):
+            gate.evaluate(document)
+
+        document = evaluation()
+        document["unexpected"] = float("nan")
+        with self.assertRaisesRegex(gate.GateInputError, "canonical JSON"):
             gate.evaluate(document)
 
     def test_case_set_must_match_frozen_contract(self) -> None:

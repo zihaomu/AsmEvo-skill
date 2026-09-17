@@ -14,13 +14,40 @@ The backend must provide:
 | `roundtrip` | an unmodified recovery can be rebuilt and compared with `K0`, masking only documented linker-derived fields |
 | `rebuild` | a changed body becomes a loadable code object without changing the frozen host interface |
 | `static_check` | kernarg layout, symbols, launch semantics, descriptors, metadata, and declared resources are consistent |
-| `oracle` | the unmodified binary can execute the evaluation contract |
-| `replay` | candidates run with identical launch geometry and initial state |
+| `oracle` | only frozen `K0` executes to produce reference observations for the evaluation contract |
+| `replay` | the rebuilt round-trip artifact or a candidate runs with identical launch geometry and initial state |
 | `compare` | all observable outputs, exact state, and guard regions are checked |
 | `benchmark` | stable raw timing samples are collected after correctness succeeds |
 
 If any capability is absent, switch to audit mode. Do not call the run a binary
 optimization and do not patch a production artifact.
+
+## Controller execution roles
+
+Use `scripts/controller.py` for every measured binary run. During initialization
+it executes this prefix:
+
+```text
+recover K0 -> rebuild without edits -> roundtrip -> static_check
+  -> oracle(K0) -> replay(rebuilt roundtrip) -> compare
+```
+
+During candidate evaluation it executes:
+
+```text
+rebuild(proposal) -> static_check(candidate)
+  -> oracle(K0) -> replay(candidate) -> compare
+```
+
+The `oracle` adapter must always receive the frozen original artifact. It must
+never execute the candidate or use candidate-produced state as the reference.
+Only `replay` receives candidate bytes. The controller binds both observation
+artifacts into the `compare` request, writes a correctness receipt after comparison
+passes, and invokes `benchmark` only after that receipt exists.
+
+Direct `gate.py` or public `lineage.py` commands do not enforce this execution
+chain and remain legacy low-level interfaces. A binary result is controller-bound
+only when its lineage contains the matching baseline and candidate receipts.
 
 ## Recovery and round-trip
 
@@ -95,3 +122,10 @@ path with recompilation disabled, then rerun its native tests and launch contrac
 
 Describe all conclusions as empirical and limited to the captured or generated
 cases. Binary mode is not formal equivalence verification.
+
+For a cooperative caller, controller binding enforces the adapter invocation
+order and binds the recorded bytes. It is not authentication against a same-user
+Python caller and does not establish that the adapters, runtime, driver, GPU, or
+remote worker are honest. The environment manifest similarly binds a declared
+identity; it does not validate the live `PATH`, `PYTHONPATH`, `LD_PRELOAD`, or
+other process-injection state.

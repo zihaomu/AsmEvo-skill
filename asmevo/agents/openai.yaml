@@ -1,4 +1,4 @@
 interface:
   display_name: "AsmEvo"
-  short_description: "Evolve AMDGCN kernels behind hard gates"
-  default_prompt: "Use $asmevo to optimize this AMDGCN assembly or AMDGPU code object under deterministic correctness and performance gates."
+  short_description: "Optimize AMDGCN with controller-bound gates"
+  default_prompt: "Use $asmevo and scripts/controller.py to optimize this AMDGCN assembly or AMDGPU code object through controller-bound correctness and performance gates; treat direct gate.py and public lineage.py workflows as legacy evidence."
