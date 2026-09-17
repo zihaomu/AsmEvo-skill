@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "mode": "source",
+  "target_arch": "gfx942",
+  "environment_sha256": "REPLACE_WITH_SHA256_OF_ENVIRONMENT_MANIFEST",
+  "case_ids": [
+    "m1024-n1024-k1024-fp16-seed0"
+  ],
+  "equivalence_policy": {
+    "min_cosine_similarity": 0.9999,
+    "max_absolute_error": 0.001,
+    "require_integer_exact": true,
+    "require_guards_intact": true
+  },
+  "performance_policy": {
+    "minimum_samples": 5,
+    "minimum_relative_improvement": 0.002,
+    "cv_multiplier": 0.85,
+    "maximum_cv": 0.03,
+    "speedup_floor": 1.0
+  }
+}

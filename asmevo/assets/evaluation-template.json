@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "candidate_id": "c001",
+  "parent_id": "K0",
+  "original_id": "K0",
+  "mode": "source",
+  "proposal_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "contract": {
+    "schema_version": 1,
+    "mode": "source",
+    "target_arch": "gfx942",
+    "environment_sha256": "3936e10403f7c799226cd82ac4ba751fe41b94ddbba0efd18b0a8cf8a0310844",
+    "case_ids": [
+      "m1024-n1024-k1024-fp16-seed0"
+    ],
+    "equivalence_policy": {
+      "min_cosine_similarity": 0.9999,
+      "max_absolute_error": 0.001,
+      "require_integer_exact": true,
+      "require_guards_intact": true
+    },
+    "performance_policy": {
+      "minimum_samples": 5,
+      "minimum_relative_improvement": 0.002,
+      "cv_multiplier": 0.85,
+      "maximum_cv": 0.03,
+      "speedup_floor": 1.0
+    }
+  },
+  "artifacts": {
+    "original_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "parent_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "candidate_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "checks": {
+    "build": {
+      "passed": true,
+      "evidence": "build.log"
+    },
+    "static_consistency": {
+      "required": false,
+      "passed": true,
+      "evidence": "not required in source mode"
+    }
+  },
+  "equivalence": {
+    "cases": [
+      {
+        "case_id": "m1024-n1024-k1024-fp16-seed0",
+        "runtime_ok": true,
+        "float_metrics_applicable": true,
+        "cosine_similarity": 1.0,
+        "max_absolute_error": 0.0,
+        "integer_exact": true,
+        "guards_intact": true
+      }
+    ]
+  },
+  "timing": {
+    "valid": true,
+    "original_ms": [1.01, 1.0, 0.99, 1.0, 1.0],
+    "parent_ms": [1.01, 1.0, 0.99, 1.0, 1.0],
+    "candidate_ms": [0.91, 0.9, 0.9, 0.89, 0.9]
+  }
+}
