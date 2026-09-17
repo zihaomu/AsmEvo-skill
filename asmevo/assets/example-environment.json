@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "purpose": "schema-smoke-test-only",
+  "target_arch": "gfx942",
+  "rocm": "example",
+  "driver": "example",
+  "clock_policy": "example"
+}
