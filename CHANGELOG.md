@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0.0 - 2026-09-18
+
+- Add schema-v2 `optimization_surface` contracts while preserving schema-v1
+  evidence without inferring a stronger historical claim.
+- Add fail-closed AMDGCN source-assembly controller gates for fresh compilation,
+  real code-object kinds, non-empty in-window instruction diffs, ABI/resources,
+  native loading, parent profiles, and post-benchmark candidate profiles.
+- Add generic capability probing, assembly/link, normalized disassembly,
+  instruction diff, resource scan, and profile-evidence tools and schemas.
+- Re-profile only performance-qualified ASM candidates; a missing or failed fresh
+  profile blocks promotion.
+- Keep fixed launchers, operator contracts, workload/reference harnesses, public
+  API acceptance, and private machine data in the consuming project rather than
+  the reusable skill.
+- Add controller-v2 lineage verification and unit coverage while keeping
+  controller-v1 evidence readable.
+
 ## 0.2.0.0 - 2026-09-17
 
 - Add a controller-owned baseline and candidate state machine that directly
