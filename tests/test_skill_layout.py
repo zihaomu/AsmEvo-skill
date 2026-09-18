@@ -25,15 +25,32 @@ class SkillLayoutTests(unittest.TestCase):
             "scripts/controller.py",
             "scripts/lineage.py",
             "scripts/preflight.py",
+            "scripts/capability_probe.py",
+            "scripts/assemble.py",
+            "scripts/disassemble.py",
+            "scripts/code_object_diff.py",
+            "scripts/resource_check.py",
+            "scripts/profile.py",
+            "scripts/backends/common.py",
+            "scripts/backends/source.py",
+            "scripts/backends/amdgcn_assembly.py",
+            "scripts/backends/hsaco_binary.py",
             "references/acceptance-contract.md",
             "references/adapter-contract.md",
+            "references/assembly-backend.md",
             "references/binary-backend.md",
             "references/controller-contract.md",
             "references/failure-taxonomy.md",
             "references/optimization-playbook.md",
+            "references/profiling-contract.md",
             "assets/evaluation-template.json",
             "assets/contract-template.json",
             "assets/example-environment.json",
+            "assets/schemas/capability-report.schema.json",
+            "assets/schemas/asm-candidate.schema.json",
+            "assets/schemas/profile-evidence.schema.json",
+            "assets/architectures/gfx11.json",
+            "assets/architectures/gfx12.json",
         ]
         for relative in expected:
             with self.subTest(relative=relative):
@@ -80,9 +97,22 @@ class SkillLayoutTests(unittest.TestCase):
         root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         skill_version = (SKILL / "VERSION").read_text(encoding="utf-8").strip()
 
-        self.assertEqual(root_version, "0.2.0.0")
+        self.assertEqual(root_version, "0.3.0.0")
         self.assertEqual(skill_version, root_version)
-        self.assertTrue((SKILL / "scripts" / "controller.py").stat().st_mode & 0o111)
+        for script in (
+            "controller.py",
+            "gate.py",
+            "lineage.py",
+            "preflight.py",
+            "capability_probe.py",
+            "assemble.py",
+            "disassemble.py",
+            "code_object_diff.py",
+            "resource_check.py",
+            "profile.py",
+        ):
+            with self.subTest(script=script):
+                self.assertTrue((SKILL / "scripts" / script).stat().st_mode & 0o111)
 
     def test_evaluation_example_binds_its_environment_manifest(self) -> None:
         evaluation = json.loads(

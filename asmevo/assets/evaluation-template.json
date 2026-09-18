@@ -1,13 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "candidate_id": "c001",
   "parent_id": "K0",
   "original_id": "K0",
   "mode": "source",
+  "optimization_surface": "hip_source",
   "proposal_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
   "contract": {
-    "schema_version": 1,
+    "schema_version": 2,
     "mode": "source",
+    "optimization_surface": "hip_source",
     "target_arch": "gfx942",
     "environment_sha256": "3936e10403f7c799226cd82ac4ba751fe41b94ddbba0efd18b0a8cf8a0310844",
     "case_ids": [
