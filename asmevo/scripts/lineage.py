@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any
 
 import gate
-import preflight
+from backends import amdgcn_assembly
+from backends import common as backend_common
 
 
 class LineageError(ValueError):
@@ -29,6 +30,12 @@ class LineageError(ValueError):
 
 
 _CONTROLLER_TOKEN = object()
+_CONTROLLER_POLICIES = {1: "controller-v1", 2: "controller-v2"}
+
+
+def _controller_policy(contract: dict[str, Any]) -> str:
+    values = gate.validate_contract(contract)
+    return _CONTROLLER_POLICIES[values["schema_version"]]
 
 
 def _reject_constant(value: str) -> None:
@@ -140,19 +147,30 @@ def _validate_preflight(
     report: dict[str, Any], contract: dict[str, Any], original_sha256: str
 ) -> None:
     contract_values = gate.validate_contract(contract)
-    expected_capabilities = (
-        preflight.SOURCE_CAPABILITIES
-        if contract_values["mode"] == "source"
-        else preflight.BINARY_CAPABILITIES
+    expected_capabilities = backend_common.required_capabilities(
+        contract_values["mode"], contract_values["optimization_surface"]
     )
-    if report.get("schema_version") != 1:
+    expected_preflight_schema = 1 if contract_values["legacy_surface"] else 2
+    if report.get("schema_version") != expected_preflight_schema:
         raise LineageError("unsupported preflight schema")
+    if expected_preflight_schema == 2 and report.get("kind") != (
+        "asmevo.capability-report.v2"
+    ):
+        raise LineageError("v2 preflight report kind is invalid")
     if report.get("ready") is not True or report.get("status") != "ready":
         raise LineageError("preflight report is not ready")
     if report.get("failures") != []:
         raise LineageError("ready preflight report contains failures")
     if report.get("mode") != contract_values["mode"]:
         raise LineageError("preflight mode does not match workload contract")
+    if (
+        not contract_values["legacy_surface"]
+        and report.get("optimization_surface")
+        != contract_values["optimization_surface"]
+    ):
+        raise LineageError(
+            "preflight optimization surface does not match workload contract"
+        )
     if report.get("target_arch") != contract_values["target_arch"]:
         raise LineageError(
             "preflight target architecture does not match workload contract"
@@ -202,6 +220,38 @@ def _validate_preflight(
             raise LineageError(f"preflight capability is no longer executable: {name}")
         if _sha256(executable) != capability["sha256"]:
             raise LineageError(f"preflight capability changed after inspection: {name}")
+    if not contract_values["legacy_surface"]:
+        required_features = report.get("required_features")
+        features = report.get("features")
+        if not isinstance(required_features, list) or not isinstance(features, dict):
+            raise LineageError("v2 preflight feature report is incomplete")
+        if any(features.get(name) is not True for name in required_features):
+            raise LineageError("v2 preflight has unverified required features")
+        tools = report.get("tools")
+        if not isinstance(tools, dict):
+            raise LineageError("v2 preflight tool identity map is missing")
+        for name, tool in tools.items():
+            if not isinstance(name, str) or not isinstance(tool, dict):
+                raise LineageError("v2 preflight tool identity is malformed")
+            resolved = tool.get("resolved")
+            expected_hash = tool.get("sha256")
+            if resolved is None:
+                continue
+            executable = Path(str(resolved))
+            try:
+                metadata = executable.lstat()
+            except OSError as error:
+                raise LineageError(
+                    f"preflight tool is unavailable: {name}: {error}"
+                ) from error
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or not os.access(executable, os.X_OK)
+            ):
+                raise LineageError(f"preflight tool is no longer executable: {name}")
+            if _sha256(executable) != expected_hash:
+                raise LineageError(f"preflight tool changed after inspection: {name}")
 
 
 def _load_and_validate_preflight(
@@ -251,6 +301,10 @@ def _validate_phase_evidence(
     capabilities = preflight_report.get("capabilities")
     if not isinstance(capabilities, dict):
         raise LineageError("controller preflight capability map is missing")
+    adapter_schema = preflight_report.get("schema_version")
+    if adapter_schema not in {1, 2}:
+        raise LineageError("controller preflight uses an unsupported schema")
+    adapter_protocol = f"asmevo.adapter.v{adapter_schema}"
     parsed: list[dict[str, Any]] = []
     for index, (raw_record, operation) in enumerate(
         zip(records, expected_operations, strict=True)
@@ -288,8 +342,8 @@ def _validate_phase_evidence(
         request = _load_json_object(loaded_files["request"], f"{operation} request")
         request_id = raw_record.get("request_id")
         if (
-            request.get("schema_version") != 1
-            or request.get("protocol") != "asmevo.adapter.v1"
+            request.get("schema_version") != adapter_schema
+            or request.get("protocol") != adapter_protocol
             or request.get("operation") != operation
             or request.get("request_id") != request_id
             or not isinstance(request.get("binding"), dict)
@@ -316,8 +370,8 @@ def _validate_phase_evidence(
                 raise
         if response is not None:
             if (
-                response.get("schema_version") != 1
-                or response.get("protocol") != "asmevo.adapter.v1"
+                response.get("schema_version") != adapter_schema
+                or response.get("protocol") != adapter_protocol
                 or response.get("operation") != operation
                 or response.get("request_id") != request_id
                 or response.get("binding") != request.get("binding")
@@ -348,6 +402,12 @@ def _validate_phase_evidence(
                 and "observations" in request["outputs"]
             ):
                 output_name = "observations"
+                response_hash_name = "output_sha256"
+            elif operation == "disassemble":
+                output_name = "disassembly_evidence"
+                response_hash_name = "output_sha256"
+            elif operation == "profile":
+                output_name = "profile_evidence"
                 response_hash_name = "output_sha256"
             if output_name is not None and response_hash_name is not None:
                 outputs = request.get("outputs")
@@ -473,16 +533,17 @@ def _validate_baseline_receipt(
     baseline_median_ms: float,
     preflight_report: dict[str, Any],
 ) -> None:
+    contract_values = gate.validate_contract(contract)
+    receipt_schema = contract_values["schema_version"]
     if (
-        receipt.get("schema_version") != 1
-        or receipt.get("kind") != "asmevo.baseline-receipt.v1"
+        receipt.get("schema_version") != receipt_schema
+        or receipt.get("kind") != f"asmevo.baseline-receipt.v{receipt_schema}"
         or receipt.get("status") != "verified"
     ):
         raise LineageError("invalid controller baseline receipt")
     bindings = receipt.get("bindings")
     if not isinstance(bindings, dict):
         raise LineageError("baseline receipt bindings are missing")
-    contract_values = gate.validate_contract(contract)
     expected = {
         "original_id": original_id,
         "mode": contract_values["mode"],
@@ -493,6 +554,8 @@ def _validate_baseline_receipt(
         "original_sha256": original_sha256,
         "case_ids": contract_values["case_ids"],
     }
+    if receipt_schema == 2:
+        expected["optimization_surface"] = contract_values["optimization_surface"]
     if bindings != expected:
         raise LineageError("baseline receipt does not match frozen run identities")
     correctness = receipt.get("correctness_receipt")
@@ -502,8 +565,8 @@ def _validate_baseline_receipt(
     if _document_digest(correctness) != correctness_hash:
         raise LineageError("baseline correctness receipt hash does not match")
     if (
-        correctness.get("schema_version") != 1
-        or correctness.get("kind") != "asmevo.correctness-receipt.v1"
+        correctness.get("schema_version") != receipt_schema
+        or correctness.get("kind") != f"asmevo.correctness-receipt.v{receipt_schema}"
         or correctness.get("status") != "correctness_passed"
     ):
         raise LineageError("baseline correctness receipt did not pass")
@@ -529,6 +592,10 @@ def _validate_baseline_receipt(
         "parent_sha256": original_sha256,
         "case_ids": contract_values["case_ids"],
     }
+    if receipt_schema == 2:
+        expected_correctness["optimization_surface"] = contract_values[
+            "optimization_surface"
+        ]
     if any(
         correctness_bindings.get(key) != value
         for key, value in expected_correctness.items()
@@ -544,7 +611,7 @@ def _validate_baseline_receipt(
     if correctness_bindings != expected_correctness:
         raise LineageError("baseline correctness receipt has unexpected bindings")
     probe = {
-        "schema_version": 1,
+        "schema_version": receipt_schema,
         "candidate_id": candidate_id,
         "parent_id": original_id,
         "original_id": original_id,
@@ -560,6 +627,8 @@ def _validate_baseline_receipt(
         "equivalence": equivalence,
         "timing": {"valid": False, "invalid_reason": "baseline receipt probe"},
     }
+    if receipt_schema == 2:
+        probe["optimization_surface"] = contract_values["optimization_surface"]
     try:
         correctness_decision = gate.evaluate(probe)
     except gate.GateInputError as error:
@@ -567,10 +636,19 @@ def _validate_baseline_receipt(
     if correctness_decision.get("status") != "timing_invalid":
         raise LineageError("baseline correctness receipt does not pass the gate")
 
-    expected_operations = (
-        ["oracle", "benchmark"]
-        if contract_values["mode"] == "source"
-        else [
+    if contract_values["optimization_surface"] == "amdgcn_assembly":
+        expected_operations = [
+            "disassemble",
+            "static_check",
+            "native_load",
+            "oracle",
+            "benchmark",
+            "profile",
+        ]
+    elif contract_values["mode"] == "source":
+        expected_operations = ["oracle", "benchmark"]
+    else:
+        expected_operations = [
             "recover",
             "rebuild",
             "roundtrip",
@@ -580,7 +658,6 @@ def _validate_baseline_receipt(
             "compare",
             "benchmark",
         ]
-    )
     phase_evidence = receipt.get("phase_evidence")
     parsed = _validate_phase_evidence(
         phase_evidence,
@@ -588,7 +665,12 @@ def _validate_baseline_receipt(
         expected_operations=expected_operations,
         require_all_success=True,
     )
-    if correctness.get("phase_evidence") != phase_evidence[:-1]:
+    correctness_phases = (
+        phase_evidence[:4]
+        if contract_values["optimization_surface"] == "amdgcn_assembly"
+        else phase_evidence[:-1]
+    )
+    if correctness.get("phase_evidence") != correctness_phases:
         raise LineageError("baseline correctness receipt has a spliced phase chain")
     common_binding = {
         "mode": contract_values["mode"],
@@ -603,8 +685,65 @@ def _validate_baseline_receipt(
         "proposal_sha256": original_sha256,
         "case_ids": contract_values["case_ids"],
     }
+    if receipt_schema == 2:
+        common_binding["optimization_surface"] = contract_values["optimization_surface"]
     _validate_common_bindings(parsed, common_binding)
-    if contract_values["mode"] == "source":
+    if contract_values["optimization_surface"] == "amdgcn_assembly":
+        asm = checks.get("asm_provenance")
+        if not isinstance(asm, dict):
+            raise LineageError("ASM baseline provenance is missing")
+        if checks.get("static_consistency", {}).get("evidence") != phase_evidence[1]:
+            raise LineageError("ASM baseline static evidence is not bound")
+        disassembly_response = parsed[0].get("response")
+        if not isinstance(disassembly_response, dict) or asm.get(
+            "artifact_kind"
+        ) != disassembly_response.get("artifact_kind"):
+            raise LineageError("ASM baseline disassembly is not bound")
+        static_response = parsed[1].get("response")
+        if (
+            not isinstance(static_response, dict)
+            or static_response.get("abi_consistent") is not True
+            or static_response.get("resource_consistent") is not True
+        ):
+            raise LineageError("ASM baseline static check did not pass")
+        if asm.get("native_load_passed") is not True:
+            raise LineageError("ASM baseline native-load gate did not pass")
+        profile_identity = parsed[5].get("output_identity")
+        post_benchmark_profile = receipt.get("post_benchmark_profile")
+        if (
+            not isinstance(profile_identity, dict)
+            or not isinstance(post_benchmark_profile, dict)
+            or post_benchmark_profile.get("captured") is not True
+            or post_benchmark_profile.get("profile_evidence_sha256")
+            != profile_identity.get("sha256")
+        ):
+            raise LineageError("ASM baseline profile identity is not bound")
+        profile_document = _load_json_object(
+            Path(profile_identity["path"]), "ASM baseline profile evidence"
+        )
+        try:
+            amdgcn_assembly.validate_profile_evidence(
+                profile_document,
+                artifact_sha256=original_sha256,
+                target_arch=contract_values["target_arch"],
+                contract_sha256=gate.contract_digest(contract),
+                environment_sha256=environment_sha256,
+            )
+        except backend_common.BackendContractError as error:
+            raise LineageError(str(error)) from error
+        oracle_candidate = (
+            parsed[3]["request"].get("inputs", {}).get("candidate_artifact")
+        )
+        profile_candidate = (
+            parsed[5]["request"].get("inputs", {}).get("candidate_artifact")
+        )
+        if (
+            not isinstance(oracle_candidate, dict)
+            or oracle_candidate.get("sha256") != original_sha256
+            or profile_candidate != oracle_candidate
+        ):
+            raise LineageError("ASM baseline did not execute and profile K0")
+    elif contract_values["mode"] == "source":
         oracle_candidate = (
             parsed[0]["request"].get("inputs", {}).get("candidate_artifact")
         )
@@ -650,19 +789,30 @@ def _validate_baseline_receipt(
             raise LineageError(
                 "binary baseline compare did not consume frozen observations"
             )
-    compare_index = 0 if contract_values["mode"] == "source" else 6
+    compare_index = (
+        3
+        if contract_values["optimization_surface"] == "amdgcn_assembly"
+        else 0
+        if contract_values["mode"] == "source"
+        else 6
+    )
     compare_response = parsed[compare_index]["response"]
     if (
         not isinstance(compare_response, dict)
         or compare_response.get("equivalence") != equivalence
     ):
         raise LineageError("baseline adapter response does not bind equivalence")
-    benchmark_response = parsed[-1]["response"]
+    benchmark_index = (
+        4
+        if contract_values["optimization_surface"] == "amdgcn_assembly"
+        else len(parsed) - 1
+    )
+    benchmark_response = parsed[benchmark_index]["response"]
     original_identity = preflight_report.get("artifact")
     if not isinstance(original_identity, dict):
         raise LineageError("baseline preflight artifact identity is missing")
     _validate_benchmark_authorization(
-        parsed[-1],
+        parsed[benchmark_index],
         receipt=correctness,
         receipt_sha256=correctness_hash,
         measure_artifacts={"original": original_identity},
@@ -710,7 +860,7 @@ def _validate_baseline_receipt(
 def _verify_controller_baseline(
     document: dict[str, Any], contract: dict[str, Any]
 ) -> None:
-    if document.get("record_policy", "legacy-v1") != "controller-v1":
+    if document.get("record_policy", "legacy-v1") != _controller_policy(contract):
         return
     raw_path = document.get("baseline_receipt_path")
     expected_hash = document.get("baseline_receipt_sha256")
@@ -774,10 +924,13 @@ def _validate_controller_provenance(
     provenance = evaluation.get("provenance")
     if not isinstance(provenance, dict):
         raise LineageError("controller lineage requires controller provenance")
+    contract_values = gate.validate_contract(evaluation["contract"])
+    expected_schema = contract_values["schema_version"]
+    expected_policy = _CONTROLLER_POLICIES[expected_schema]
     if (
-        provenance.get("schema_version") != 1
+        provenance.get("schema_version") != expected_schema
         or provenance.get("producer") != "asmevo-controller"
-        or provenance.get("record_policy") != "controller-v1"
+        or provenance.get("record_policy") != expected_policy
     ):
         raise LineageError("unsupported controller provenance")
     status = str(expected_gate_decision.get("status"))
@@ -789,24 +942,49 @@ def _validate_controller_provenance(
         record.get("operation") if isinstance(record, dict) else None
         for record in phase_evidence
     ]
-    full_chain = (
-        ["build", "oracle", "benchmark"]
-        if mode == "source"
-        else ["rebuild", "static_check", "oracle", "replay", "compare", "benchmark"]
-    )
+    surface = contract_values["optimization_surface"]
+    if surface == "amdgcn_assembly":
+        full_chain = [
+            "build",
+            "disassemble",
+            "static_check",
+            "native_load",
+            "oracle",
+            "benchmark",
+            "profile",
+        ]
+    elif mode == "source":
+        full_chain = ["build", "oracle", "benchmark"]
+    else:
+        full_chain = [
+            "rebuild",
+            "static_check",
+            "oracle",
+            "replay",
+            "compare",
+            "benchmark",
+        ]
     prefix_rejections = {
         "build_invalid",
         "static_invalid",
+        "asm_provenance_invalid",
         "runtime_failure",
         "canary_corruption",
         "divergent",
     }
-    if status in prefix_rejections:
+    benchmark_observed = "benchmark" in observed_operations
+    if status in prefix_rejections and not benchmark_observed:
         if provenance.get("stage") != "correctness_rejected":
             raise LineageError("controller rejection has an invalid stage marker")
         if status == "build_invalid":
             allowed_chains = [full_chain[:1]]
-        elif (status == "static_invalid" and mode == "binary") or mode == "source":
+        elif status == "asm_provenance_invalid" and surface == "amdgcn_assembly":
+            allowed_chains = [full_chain[:length] for length in range(2, 7)]
+        elif status == "static_invalid" and surface == "amdgcn_assembly":
+            allowed_chains = [full_chain[:3]]
+        elif (status == "static_invalid" and mode == "binary") or (
+            mode == "source" and surface != "amdgcn_assembly"
+        ):
             allowed_chains = [full_chain[:2]]
         elif status in {"divergent", "canary_corruption"}:
             allowed_chains = [full_chain[:5]]
@@ -815,9 +993,13 @@ def _validate_controller_provenance(
         if observed_operations not in allowed_chains:
             raise LineageError("controller rejection has an impossible phase chain")
     else:
-        if (
-            provenance.get("stage") != "benchmarked"
-            or observed_operations != full_chain
+        valid_timing_chains = [full_chain]
+        if surface == "amdgcn_assembly":
+            valid_timing_chains.append(full_chain[:-1])
+        if status == "profile_required":
+            raise LineageError("controller cannot record an unfinished profile gate")
+        if provenance.get("stage") != "benchmarked" or (
+            observed_operations not in valid_timing_chains
         ):
             raise LineageError("controller timing evidence has an invalid phase chain")
 
@@ -844,12 +1026,24 @@ def _validate_controller_provenance(
         "proposal_sha256": expected_gate_decision.get("proposal_sha256"),
         "case_ids": gate.validate_contract(evaluation["contract"])["case_ids"],
     }
+    if expected_schema == 2:
+        common_binding["optimization_surface"] = surface
     _validate_common_bindings(parsed, common_binding)
     for index, phase in enumerate(parsed):
         expected_candidate = None if index == 0 else artifacts.get("candidate_sha256")
         if phase["request"]["binding"].get("candidate_sha256") != expected_candidate:
             raise LineageError("controller request has a stale candidate artifact")
-    if mode == "source" and len(parsed) >= 2:
+    if surface == "amdgcn_assembly" and len(parsed) >= 5:
+        oracle_candidate = (
+            parsed[4]["request"].get("inputs", {}).get("candidate_artifact")
+        )
+        if (
+            not isinstance(oracle_candidate, dict)
+            or oracle_candidate != parsed[0].get("output_identity")
+            or oracle_candidate.get("sha256") != artifacts.get("candidate_sha256")
+        ):
+            raise LineageError("ASM oracle did not receive the candidate artifact")
+    elif mode == "source" and len(parsed) >= 2:
         oracle_candidate = (
             parsed[1]["request"].get("inputs", {}).get("candidate_artifact")
         )
@@ -891,9 +1085,10 @@ def _validate_controller_provenance(
     ):
         raise LineageError("controller build check is not bound to raw evidence")
     if (
-        mode == "binary"
-        and len(phase_evidence) >= 2
-        and checks.get("static_consistency", {}).get("evidence") != phase_evidence[1]
+        (mode == "binary" or surface == "amdgcn_assembly")
+        and len(phase_evidence) >= (3 if surface == "amdgcn_assembly" else 2)
+        and checks.get("static_consistency", {}).get("evidence")
+        != phase_evidence[2 if surface == "amdgcn_assembly" else 1]
     ):
         raise LineageError("controller static check is not bound to raw evidence")
     build_response = parsed[0]["response"]
@@ -902,9 +1097,133 @@ def _validate_controller_provenance(
         or build_response.get("candidate_sha256") != artifacts.get("candidate_sha256")
     ):
         raise LineageError("controller build response does not bind candidate bytes")
+    if surface == "amdgcn_assembly" and parsed[0]["record"].get("ok") is True:
+        asm = checks.get("asm_provenance")
+        if not isinstance(asm, dict) or not isinstance(build_response, dict):
+            raise LineageError("ASM provenance is missing")
+        for key in ("compiled", "precompiled_variant", "artifact_kind"):
+            if asm.get(key) != build_response.get(key):
+                raise LineageError(f"ASM build response does not bind {key}")
+        build_inputs = parsed[0]["request"].get("inputs")
+        proposal_input = (
+            build_inputs.get("proposal") if isinstance(build_inputs, dict) else None
+        )
+        candidate_source = (
+            build_inputs.get("candidate_source")
+            if isinstance(build_inputs, dict)
+            else None
+        )
+        parent_profile = (
+            build_inputs.get("parent_profile_evidence")
+            if isinstance(build_inputs, dict)
+            else None
+        )
+        if (
+            not isinstance(proposal_input, dict)
+            or proposal_input.get("sha256")
+            != expected_gate_decision.get("proposal_sha256")
+            or not isinstance(proposal_input.get("path"), str)
+        ):
+            raise LineageError("ASM build did not consume the frozen proposal")
+        proposal_path = Path(proposal_input["path"])
+        if not proposal_path.is_file() or _sha256(proposal_path) != proposal_input.get(
+            "sha256"
+        ):
+            raise LineageError("ASM proposal snapshot changed")
+        if (
+            not isinstance(candidate_source, dict)
+            or not isinstance(candidate_source.get("path"), str)
+            or not isinstance(candidate_source.get("sha256"), str)
+        ):
+            raise LineageError("ASM build did not consume frozen candidate source")
+        candidate_source_path = Path(candidate_source["path"])
+        if not candidate_source_path.is_file() or _sha256(
+            candidate_source_path
+        ) != candidate_source.get("sha256"):
+            raise LineageError("ASM candidate source snapshot changed")
+        if (
+            not isinstance(parent_profile, dict)
+            or parent_profile.get("sha256") != asm.get("profile_evidence_sha256")
+            or not isinstance(parent_profile.get("path"), str)
+        ):
+            raise LineageError("ASM proposal is not bound to parent profile evidence")
+        parent_profile_path = Path(parent_profile["path"])
+        if not parent_profile_path.is_file() or _sha256(
+            parent_profile_path
+        ) != parent_profile.get("sha256"):
+            raise LineageError("ASM parent profile evidence changed")
+        parent_profile_document = _load_json_object(
+            parent_profile_path, "ASM parent profile evidence"
+        )
+        proposal_document = _load_json_object(proposal_path, "ASM proposal")
+        try:
+            amdgcn_assembly.validate_profile_evidence(
+                parent_profile_document,
+                artifact_sha256=str(artifacts.get("parent_sha256")),
+                target_arch=contract_values["target_arch"],
+                contract_sha256=expected_gate_decision["contract_sha256"],
+                environment_sha256=str(lineage_document.get("environment_sha256")),
+            )
+            amdgcn_assembly.validate_proposal(
+                proposal_document,
+                parent_sha256=str(artifacts.get("parent_sha256")),
+                profile_evidence_sha256=str(parent_profile.get("sha256")),
+            )
+        except backend_common.BackendContractError as error:
+            raise LineageError(str(error)) from error
+        if len(parsed) >= 2:
+            disassembly_response = parsed[1].get("response")
+            diff = (
+                disassembly_response.get("instruction_diff")
+                if isinstance(disassembly_response, dict)
+                else None
+            )
+            if (
+                not isinstance(diff, dict)
+                or asm.get("instruction_diff_nonempty") != diff.get("nonempty")
+                or asm.get("diff_within_declared_windows")
+                != diff.get("within_declared_windows")
+                or asm.get("artifact_kind") != disassembly_response.get("artifact_kind")
+            ):
+                raise LineageError("ASM disassembly response does not bind the diff")
+        if len(parsed) >= 3:
+            static_response = parsed[2].get("response")
+            static_passed = bool(
+                parsed[2]["record"].get("ok")
+                and isinstance(static_response, dict)
+                and static_response.get("abi_consistent") is True
+                and static_response.get("resource_consistent") is True
+            )
+            if checks.get("static_consistency", {}).get("passed") != static_passed:
+                raise LineageError("ASM resource response does not bind static gate")
+        if len(parsed) >= 4 and asm.get("native_load_passed") != parsed[3][
+            "record"
+        ].get("ok"):
+            raise LineageError("ASM native-load response does not bind the gate")
+        if len(parsed) >= 7 and parsed[6]["record"].get("ok") is True:
+            profile_identity = parsed[6].get("output_identity")
+            if not isinstance(profile_identity, dict) or asm.get(
+                "candidate_profile_evidence_sha256"
+            ) != profile_identity.get("sha256"):
+                raise LineageError("ASM candidate profile identity is not bound")
+            profile_document = _load_json_object(
+                Path(profile_identity["path"]), "ASM candidate profile evidence"
+            )
+            try:
+                amdgcn_assembly.validate_profile_evidence(
+                    profile_document,
+                    artifact_sha256=str(artifacts.get("candidate_sha256")),
+                    target_arch=contract_values["target_arch"],
+                    contract_sha256=expected_gate_decision["contract_sha256"],
+                    environment_sha256=str(lineage_document.get("environment_sha256")),
+                )
+            except backend_common.BackendContractError as error:
+                raise LineageError(str(error)) from error
 
-    if status in prefix_rejections:
-        correctness_index = 1 if mode == "source" else 4
+    if status in prefix_rejections and not benchmark_observed:
+        correctness_index = (
+            4 if surface == "amdgcn_assembly" else 1 if mode == "source" else 4
+        )
         if len(parsed) > correctness_index:
             correctness_response = parsed[correctness_index]["response"]
             if (
@@ -925,16 +1244,39 @@ def _validate_controller_provenance(
     if _document_digest(receipt) != receipt_hash:
         raise LineageError("controller correctness receipt hash does not match")
     if (
-        receipt.get("schema_version") != 1
-        or receipt.get("kind") != "asmevo.correctness-receipt.v1"
+        receipt.get("schema_version") != expected_schema
+        or receipt.get("kind") != f"asmevo.correctness-receipt.v{expected_schema}"
         or receipt.get("status") != "correctness_passed"
     ):
         raise LineageError("controller correctness receipt did not pass")
-    if receipt.get("checks") != evaluation.get("checks") or receipt.get(
+    receipt_checks = receipt.get("checks")
+    evaluation_checks = evaluation.get("checks")
+    if surface == "amdgcn_assembly":
+        if not isinstance(receipt_checks, dict) or not isinstance(
+            evaluation_checks, dict
+        ):
+            raise LineageError("controller ASM checks are malformed")
+        receipt_checks = copy.deepcopy(receipt_checks)
+        evaluation_checks = copy.deepcopy(evaluation_checks)
+        post_profile_keys = {
+            "candidate_profile_evidence_sha256",
+            "profile_capture_attempted",
+            "profile_capture_failure",
+            "profile_capture_passed",
+        }
+        for document in (receipt_checks, evaluation_checks):
+            asm_checks = document.get("asm_provenance")
+            if isinstance(asm_checks, dict):
+                for key in post_profile_keys:
+                    asm_checks.pop(key, None)
+    if receipt_checks != evaluation_checks or receipt.get(
         "equivalence"
     ) != evaluation.get("equivalence"):
         raise LineageError("controller receipt does not bind the evaluated correctness")
-    if receipt.get("phase_evidence") != phase_evidence[:-1]:
+    expected_receipt_phases = (
+        phase_evidence[:5] if surface == "amdgcn_assembly" else phase_evidence[:-1]
+    )
+    if receipt.get("phase_evidence") != expected_receipt_phases:
         raise LineageError("controller correctness receipt has a spliced phase chain")
     bindings = receipt.get("bindings")
     if not isinstance(bindings, dict) or not isinstance(artifacts, dict):
@@ -955,9 +1297,13 @@ def _validate_controller_provenance(
         "candidate_sha256": artifacts.get("candidate_sha256"),
         "case_ids": contract_values["case_ids"],
     }
+    if expected_schema == 2:
+        expected["optimization_surface"] = surface
     if bindings != expected:
         raise LineageError("controller receipt does not match the gated identities")
-    correctness_index = 1 if mode == "source" else 4
+    correctness_index = (
+        4 if surface == "amdgcn_assembly" else 1 if mode == "source" else 4
+    )
     correctness_response = parsed[correctness_index]["response"]
     if mode == "binary":
         correctness_response = parsed[4]["response"]
@@ -969,14 +1315,15 @@ def _validate_controller_provenance(
         "equivalence"
     ) != evaluation.get("equivalence"):
         raise LineageError("controller adapter stdout does not bind equivalence")
-    benchmark_response = parsed[-1]["response"]
+    benchmark_index = 5 if surface == "amdgcn_assembly" else len(parsed) - 1
+    benchmark_response = parsed[benchmark_index]["response"]
     original_node = lineage_document["nodes"][lineage_document["original_id"]]
     parent_node = lineage_document["nodes"].get(expected_gate_decision.get("parent_id"))
     candidate_identity = parsed[0].get("output_identity")
     if not isinstance(parent_node, dict) or not isinstance(candidate_identity, dict):
         raise LineageError("controller benchmark artifact identity is incomplete")
     _validate_benchmark_authorization(
-        parsed[-1],
+        parsed[benchmark_index],
         receipt=receipt,
         receipt_sha256=receipt_hash,
         measure_artifacts={
@@ -991,7 +1338,7 @@ def _validate_controller_provenance(
             "candidate": candidate_identity,
         },
     )
-    if parsed[-1]["record"].get("ok") is True:
+    if parsed[benchmark_index]["record"].get("ok") is True:
         if not isinstance(benchmark_response, dict) or benchmark_response.get(
             "timing"
         ) != evaluation.get("timing"):
@@ -1002,7 +1349,8 @@ def _validate_controller_provenance(
 
 
 def _verify_controller_attempts(document: dict[str, Any]) -> None:
-    if document.get("record_policy", "legacy-v1") != "controller-v1":
+    contract = _verify_contract(document)
+    if document.get("record_policy", "legacy-v1") != _controller_policy(contract):
         return
     original_id = document["original_id"]
     expected_nodes = {original_id}
@@ -1250,7 +1598,7 @@ def initialize(
         if baseline_receipt_path is not None:
             if _controller_token is not _CONTROLLER_TOKEN:
                 raise LineageError(
-                    "controller-v1 baseline requires the controller-internal call "
+                    "controller baseline requires the controller-internal call "
                     "token; the public lineage API is legacy"
                 )
             resolved_receipt = baseline_receipt_path.resolve()
@@ -1268,7 +1616,7 @@ def initialize(
                 preflight_report=preflight_report,
             )
             baseline_receipt_sha256 = _document_digest(baseline_receipt)
-            record_policy = "controller-v1"
+            record_policy = _CONTROLLER_POLICIES[contract_values["schema_version"]]
         document = {
             "schema_version": 1,
             "record_policy": record_policy,
@@ -1334,7 +1682,7 @@ def _record_locked(
     if decision.get("contract_sha256") != document.get("contract_sha256"):
         raise LineageError("evaluation contract does not match lineage")
     record_policy = document.get("record_policy", "legacy-v1")
-    if record_policy == "controller-v1":
+    if record_policy in set(_CONTROLLER_POLICIES.values()):
         verification_level = _validate_controller_provenance(
             document, evaluation, decision
         )
@@ -1523,11 +1871,11 @@ def record(
     with _state_lock(state, exclusive=True):
         document = _load(state)
         if (
-            document.get("record_policy") == "controller-v1"
+            document.get("record_policy") in set(_CONTROLLER_POLICIES.values())
             and _controller_token is not _CONTROLLER_TOKEN
         ):
             raise LineageError(
-                "controller-v1 lineage requires the controller-internal call token; "
+                "controller lineage requires the controller-internal call token; "
                 "the public lineage API is legacy"
             )
         return _record_locked(

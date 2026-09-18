@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:asmevo:schema:capability-report:v2",
+  "title": "AsmEvo v2 capability report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "status",
+    "ready",
+    "target_arch",
+    "optimization_surfaces",
+    "tools",
+    "features"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "kind": {"const": "asmevo.capability-report.v2"},
+    "status": {"enum": ["ready", "blocked"]},
+    "ready": {"type": "boolean"},
+    "target_arch": {"type": "string", "pattern": "^gfx[0-9a-z]+$"},
+    "optimization_surfaces": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "launch_config",
+          "hip_source",
+          "triton_source",
+          "amdgcn_assembly",
+          "hsaco_binary",
+          "audit_only"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "tools": {"type": "object"},
+    "features": {
+      "type": "object",
+      "required": [
+        "assemble",
+        "link",
+        "disassemble",
+        "resource_scan",
+        "profile",
+        "native_load",
+        "binary_roundtrip"
+      ],
+      "additionalProperties": {"type": "boolean"}
+    }
+  },
+  "additionalProperties": true
+}

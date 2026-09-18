@@ -1,6 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "mode": "source",
+  "optimization_surface": "hip_source",
   "target_arch": "gfx942",
   "environment_sha256": "REPLACE_WITH_SHA256_OF_ENVIRONMENT_MANIFEST",
   "case_ids": [

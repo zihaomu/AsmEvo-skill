@@ -48,7 +48,7 @@ if control.get("spam_operation") == operation:
     sys.stdout.flush()
 
 response = {
-    "schema_version": 1,
+    "schema_version": request["schema_version"],
     "protocol": request["protocol"],
     "request_id": request["request_id"],
     "operation": operation,
@@ -78,6 +78,49 @@ elif response["ok"] and operation in {"build", "rebuild"}:
     )
     path.write_bytes(payload)
     response["candidate_sha256"] = digest(path)
+    if request["binding"].get("optimization_surface") == "amdgcn_assembly":
+        response["compiled"] = True
+        response["precompiled_variant"] = bool(control.get("precompiled_variant"))
+        response["artifact_kind"] = "hsaco"
+elif response["ok"] and operation == "disassemble":
+    path = Path(outputs["disassembly_evidence"])
+    path.write_text('{"disassembly":true}\n', encoding="utf-8")
+    response["output_sha256"] = digest(path)
+    response["artifact_kind"] = "hsaco"
+    if request["purpose"] == "candidate":
+        response["instruction_diff"] = {
+            "nonempty": True,
+            "within_declared_windows": True,
+        }
+elif response["ok"] and operation == "static_check":
+    response["abi_consistent"] = True
+    response["resource_consistent"] = True
+elif response["ok"] and operation == "profile":
+    path = Path(outputs["profile_evidence"])
+    artifact = request["inputs"]["candidate_artifact"]
+    profile = {
+        "schema_version": 2,
+        "kind": "asmevo.profile-evidence.v2",
+        "status": "complete",
+        "artifact_sha256": artifact["sha256"],
+        "target_arch": request["binding"]["target_arch"],
+        "contract_sha256": request["binding"]["contract_sha256"],
+        "environment_sha256": request["binding"]["environment_sha256"],
+        "kernel_symbol": "test_kernel",
+        "dispatch_count": 5,
+        "sampled_time_ms": 1.0,
+        "hotspots": [{"start_pc": "0x40", "end_pc": "0x78", "weight": 1.0}],
+        "counters": {"VMEM": 1},
+        "unavailable_counters": [],
+        "resources": {"vgpr_count": 8},
+        "bottleneck_class": "long_latency_memory",
+        "profiler": {"path": "fake-profiler", "sha256": "f" * 64},
+        "raw_files": [
+            {"relative_path": "fake.csv", "sha256": "e" * 64, "size_bytes": 1}
+        ],
+    }
+    path.write_text(json.dumps(profile) + "\n", encoding="utf-8")
+    response["output_sha256"] = digest(path)
 elif response["ok"] and operation in {"oracle", "replay"}:
     if "observations" in outputs:
         path = Path(outputs["observations"])
@@ -130,7 +173,9 @@ elif response["ok"] and operation == "benchmark":
             "valid": True,
             "original_ms": [1.0, 1.0, 1.0, 1.0, 1.0],
             "parent_ms": [1.0, 1.0, 1.0, 1.0, 1.0],
-            "candidate_ms": [0.9, 0.9, 0.9, 0.9, 0.9],
+            "candidate_ms": control.get(
+                "candidate_ms", [0.9, 0.9, 0.9, 0.9, 0.9]
+            ),
         }
 
 if control.get("close_streams_operation") == operation:
@@ -182,7 +227,7 @@ class ControllerTests(unittest.TestCase):
             },
         )
 
-    def _prepare(self, mode: str = "source") -> None:
+    def _prepare(self, mode: str = "source", surface: str | None = None) -> None:
         environment_hash = hashlib.sha256(self.environment.read_bytes()).hexdigest()
         template = json.loads(
             (ROOT / "asmevo" / "assets" / "contract-template.json").read_text(
@@ -190,14 +235,16 @@ class ControllerTests(unittest.TestCase):
             )
         )
         template["mode"] = mode
+        if surface is not None:
+            template["schema_version"] = 2
+            template["optimization_surface"] = surface
+        elif mode == "binary":
+            template["schema_version"] = 1
+            template.pop("optimization_surface", None)
         template["environment_sha256"] = environment_hash
         self.contract = self.directory / "contract.json"
         self.contract.write_text(json.dumps(template), encoding="utf-8")
-        capabilities = (
-            preflight.SOURCE_CAPABILITIES
-            if mode == "source"
-            else preflight.BINARY_CAPABILITIES
-        )
+        capabilities = preflight.backend_common.required_capabilities(mode, surface)
         report = preflight.inspect(
             mode=mode,
             artifact=self.original,
@@ -206,6 +253,18 @@ class ControllerTests(unittest.TestCase):
             require_gpu=False,
             target_arch="gfx942",
             detected_arches=["gfx942"],
+            optimization_surface=(
+                surface
+                if surface is not None
+                else "hip_source"
+                if mode == "source"
+                else None
+            ),
+            tools=(
+                {name: str(self.adapter) for name in preflight.ASM_TOOL_ROLES}
+                if surface == "amdgcn_assembly"
+                else {}
+            ),
         )
         self.preflight = self.directory / "preflight.json"
         self.preflight.write_text(json.dumps(report), encoding="utf-8")
@@ -219,7 +278,11 @@ class ControllerTests(unittest.TestCase):
                 environment_manifest_path=self.environment,
                 timeout_seconds=1,
             )
-        self.assertEqual(result["record_policy"], "controller-v1")
+        self.assertEqual(
+            result["record_policy"],
+            "controller-v2" if mode == "source" else "controller-v1",
+        )
+        self.initialized = result
         self.log.write_text("", encoding="utf-8")
 
     def _evaluate(
@@ -241,6 +304,149 @@ class ControllerTests(unittest.TestCase):
 
     def _operations(self) -> list[str]:
         return self.log.read_text(encoding="utf-8").splitlines()
+
+    def _evaluate_asm(self, candidate_id: str = "asm001") -> dict:
+        source = self.directory / f"{candidate_id}.s"
+        source.write_text("s_nop 0\n", encoding="utf-8")
+        profile = self.run_dir / "attempts" / "baseline-K0" / "baseline-profile.json"
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        proposal = self.directory / f"{candidate_id}.json"
+        proposal.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "optimization_surface": "amdgcn_assembly",
+                    "parent_sha256": state["nodes"]["K0"]["artifact_sha256"],
+                    "profile_evidence_sha256": hashlib.sha256(
+                        profile.read_bytes()
+                    ).hexdigest(),
+                    "kernel_symbol": "test_kernel",
+                    "bottleneck_class": "long_latency_memory",
+                    "edited_windows": [{"start_pc": "0x40", "end_pc": "0x78"}],
+                    "hypothesis": "move an independent load earlier",
+                    "expected_observation": "lower dependency stalls",
+                    "hazards": ["VGPR pressure", "waitcnt correctness"],
+                    "source_path": source.name,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self._environment():
+            return controller.evaluate_candidate(
+                state=self.state,
+                run_dir=self.run_dir,
+                candidate_id=candidate_id,
+                proposal_path=proposal,
+                profile_evidence_path=profile,
+                edit_summary="move one load in the profiled window",
+                changed_windows=[],
+                timeout_seconds=1,
+            )
+
+    def test_amdgcn_assembly_runs_real_v2_phase_chain(self) -> None:
+        self._prepare(surface="amdgcn_assembly")
+        baseline = self.run_dir / "attempts" / "baseline-K0"
+        self.assertEqual(
+            self.initialized["baseline_profile"],
+            str((baseline / "baseline-profile.json").resolve()),
+        )
+        self.assertEqual(
+            [
+                path.name.split("-", 1)[1]
+                for path in sorted(baseline.iterdir())
+                if path.is_dir() and path.name[:2].isdigit()
+            ],
+            [
+                "disassemble",
+                "static_check",
+                "native_load",
+                "oracle",
+                "benchmark",
+                "profile",
+            ],
+        )
+
+        result = self._evaluate_asm()
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(
+            result["candidate_profile"],
+            str(
+                (
+                    self.run_dir / "attempts" / "asm001" / "candidate-profile.json"
+                ).resolve()
+            ),
+        )
+        self.assertEqual(
+            self._operations(),
+            [
+                "build",
+                "disassemble",
+                "static_check",
+                "native_load",
+                "oracle",
+                "benchmark",
+                "profile",
+            ],
+        )
+        summary = lineage.summary(self.state)
+        self.assertEqual(summary["record_policy"], "controller-v2")
+        self.assertEqual(summary["best_id"], "asm001")
+
+    def test_amdgcn_assembly_rejects_precompiled_variant(self) -> None:
+        self._prepare(surface="amdgcn_assembly")
+        self.log.write_text("", encoding="utf-8")
+        self._set_control({"precompiled_variant": True})
+
+        with self.assertRaisesRegex(controller.ControllerError, "precompiled_variant"):
+            self._evaluate_asm()
+
+        self.assertEqual(self._operations(), ["build"])
+        self.assertEqual(lineage.summary(self.state)["best_id"], "K0")
+
+    def test_amdgcn_assembly_profiles_only_after_performance_qualifies(self) -> None:
+        self._prepare(surface="amdgcn_assembly")
+        self.log.write_text("", encoding="utf-8")
+        self._set_control({"candidate_ms": [1.0] * 5})
+
+        result = self._evaluate_asm()
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["status"], "insufficient_speedup")
+        self.assertEqual(
+            self._operations(),
+            [
+                "build",
+                "disassemble",
+                "static_check",
+                "native_load",
+                "oracle",
+                "benchmark",
+            ],
+        )
+
+    def test_amdgcn_assembly_profile_failure_blocks_promotion(self) -> None:
+        self._prepare(surface="amdgcn_assembly")
+        self.log.write_text("", encoding="utf-8")
+        self._set_control({"fail_operation": "profile"})
+
+        result = self._evaluate_asm()
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["status"], "asm_provenance_invalid")
+        self.assertEqual(self._operations()[-2:], ["benchmark", "profile"])
+        self.assertEqual(lineage.summary(self.state)["best_id"], "K0")
+
+    def test_amdgcn_assembly_proposal_snapshot_tampering_breaks_lineage(self) -> None:
+        self._prepare(surface="amdgcn_assembly")
+        self.log.write_text("", encoding="utf-8")
+        self._evaluate_asm()
+        proposal = self.run_dir / "attempts" / "asm001" / "proposal.snapshot"
+        proposal.chmod(0o600)
+        proposal.write_text('{"forged":true}\n', encoding="utf-8")
+
+        with self.assertRaisesRegex(lineage.LineageError, "proposal snapshot changed"):
+            lineage.summary(self.state)
 
     def test_source_happy_path_mints_receipt_before_benchmark(self) -> None:
         self._prepare()

@@ -55,6 +55,7 @@ class LineageTests(unittest.TestCase):
             require_gpu=False,
             target_arch="gfx942",
             detected_arches=["gfx942"],
+            optimization_surface="hip_source",
         )
         self.preflight.write_text(json.dumps(report), encoding="utf-8")
         lineage.initialize(

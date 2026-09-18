@@ -35,9 +35,13 @@ project's existing build, launch, profiling, and comparison tools when present.
   malicious adapter, operating system, GPU, or remote worker. These remain in the
   trusted computing base.
 
-## Select the operating mode
+## Select the optimization surface
 
-Choose the strongest mode the available evidence supports.
+Freeze `optimization_surface` before preflight. Use `launch_config`,
+`hip_source`, `triton_source`, `amdgcn_assembly`, `hsaco_binary`, or
+`audit_only`. Do not infer a stronger surface from an old run.
+
+Choose the strongest mode the available evidence supports:
 
 1. **Source mode**: editable HIP, Triton, native extension, or assembly exists and
    an independent reference implementation can be executed. Use that reference as
@@ -48,6 +52,14 @@ Choose the strongest mode the available evidence supports.
 3. **Audit mode**: the user asks for analysis only, or required GPU/build/replay
    capabilities are missing. Inspect artifacts, identify likely hot windows, and
    return an executable optimization plan. Do not claim measured improvement.
+
+`amdgcn_assembly` is source mode with a fixed host contract and a real, freshly
+assembled object or code object. Before using it, read
+[references/assembly-backend.md](references/assembly-backend.md) and
+[references/profiling-contract.md](references/profiling-contract.md).
+`hsaco_binary` remains binary mode and additionally requires verified binary
+round-trip capability. Parameter search and precompiled entry selection can
+never satisfy either ASM surface.
 
 Do not silently downgrade binary mode to source mode. State which mode is active,
 which oracle is authoritative, and which guarantees are unavailable.
@@ -67,12 +79,14 @@ Establish the following before searching:
 - profiler or static evidence used to select the first hot window;
 - writable private run directory that is not a published artifact directory.
 
-Use `scripts/preflight.py` to record artifact identity, resolved adapter paths and
-hashes, and the architecture reported by an independent GPU inventory tool. Pass
-that reported value with `--detected-arch`; `/dev/dxg`, `/dev/kfd`, or a render
-node alone does not prove the requested architecture. If the project lacks a
-command contract, read [references/adapter-contract.md](references/adapter-contract.md)
-and create the smallest project-local adapter needed for the requested run.
+Use `scripts/capability_probe.py` to bind ROCm/LLVM/profiler tool paths, versions,
+hashes, and live features. Then use `scripts/preflight.py` to record artifact
+identity, resolved adapter paths and hashes, the chosen surface, and the
+architecture reported by an independent GPU inventory tool. Pass that reported
+value with `--detected-arch`; `/dev/dxg`, `/dev/kfd`, or a render node alone does
+not prove the requested architecture. If the project lacks a command contract,
+read [references/adapter-contract.md](references/adapter-contract.md) and create
+the smallest project-local adapter needed for the requested run.
 
 For real-dispatch captures, treat kernargs and device-memory snapshots as sensitive
 data. Keep them in an authorized private workspace and never commit them.
@@ -80,8 +94,9 @@ data. Keep them in an authorized private workspace and never commit them.
 ## Establish the baseline
 
 1. Copy `assets/contract-template.json` into the private run directory. Freeze its
-   mode, target architecture, environment identity, ordered cases, comparison
-   rules, and performance thresholds before evaluating candidates.
+   mode, `optimization_surface`, target architecture, environment identity,
+   ordered cases, comparison rules, and performance thresholds before evaluating
+   candidates.
 2. Freeze the original artifact as `K0`; record its content hash.
 3. Capture the full environment manifest next to the run evidence and bind its
    identity in the frozen contract.
@@ -89,8 +104,9 @@ data. Keep them in an authorized private workspace and never commit them.
    source oracle, or the binary recover/rebuild/round-trip/static/oracle/replay/
    compare chain, mints a correctness receipt, and only then invokes the baseline
    benchmark.
-5. Confirm the resulting lineage reports `record_policy: controller-v1` and
-   preserves raw baseline timing samples. Do not use the legacy
+5. Confirm a schema-v2 run reports `record_policy: controller-v2` and preserves
+   raw baseline timing samples. Schema-v1 evidence remains readable as legacy and
+   must not be relabeled as ASM. Do not use the legacy
    `lineage.py init --baseline-median-ms` path for a measured claim.
 
 Read [references/controller-contract.md](references/controller-contract.md) for
@@ -104,15 +120,17 @@ report that failure. The search cannot repair an untrusted baseline.
 Repeat within the user's time or attempt budget:
 
 1. Profile the current verified best and identify one stall-dominant instruction
-   window or one source-level bottleneck.
+   window or one source-level bottleneck. For `amdgcn_assembly`, the proposal must
+   bind the exact profile evidence SHA-256.
 2. Form a falsifiable optimization hypothesis tied to the evidence.
 3. Read [references/optimization-playbook.md](references/optimization-playbook.md)
    only for the observed bottleneck class.
 4. Create one localized candidate edit. Preserve a clean diff against its verified
    parent and record the rationale.
 5. Submit only the proposal and descriptive edit metadata to
-   `scripts/controller.py evaluate`. Never assemble an evaluation JSON or pass
-   correctness/timing values from the model.
+   `scripts/controller.py evaluate`. Pass `--profile-evidence` for
+   `amdgcn_assembly`. Never assemble an evaluation JSON or pass correctness or
+   timing values from the model.
 6. Let the controller run build/rebuild, mandatory binary static checks, and every
    frozen correctness case. It writes a hash-bound correctness receipt before it
    can spawn the benchmark adapter.
@@ -120,8 +138,9 @@ Repeat within the user's time or attempt budget:
    timing, run the deterministic verdict, and atomically record the attempt.
 8. Distinguish branch acceptance from global-best promotion. A candidate may be a
    verified branch node while `best_id` remains a faster node from another branch.
-9. Re-profile after an accepted edit. On rejection, start the next proposal from a
-   verified node rather than from rejected bytes.
+9. The controller re-profiles only a performance-qualified ASM candidate and
+   withholds acceptance if that profile fails. On rejection, start the next
+   proposal from a verified node rather than from rejected bytes.
 
 Prefer many small, attributable edits over a large rewrite. Stop repeating a
 direction after the same failure signature recurs; summarize the exhausted
@@ -167,6 +186,8 @@ An optimization result is complete only when the user receives:
 - exact build, verification, and benchmark commands;
 - evaluated shapes, dtypes, strides, seeds, and launch configurations;
 - ABI/resource comparison where applicable;
+- optimization surface, normalized instruction diff, and parent/candidate
+  profile evidence for an ASM claim;
 - raw timing samples and the gate decision;
 - verified speedup relative to `K0` and the parent candidate;
 - candidate lineage and localized edit rationale;

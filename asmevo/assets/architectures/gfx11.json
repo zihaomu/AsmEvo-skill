@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "family": "gfx11",
+  "target_pattern": "^gfx11[0-9a-z]+$",
+  "required_live_evidence": [
+    "exact_target_arch",
+    "kernel_descriptor_wave_size",
+    "elf_code_object_version",
+    "amdgcn_assembler_support",
+    "native_load"
+  ],
+  "wave_size_policy": "Read the final kernel descriptor; never infer wave32 or wave64 from the family name.",
+  "code_object_policy": "Read the final ELF and loader support; never infer a code-object version from the family name.",
+  "reference": "https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html",
+  "note": "Detection policy only; this file contains no host support claim or unmeasured tuning recommendation."
+}

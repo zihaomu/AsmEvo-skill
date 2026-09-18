@@ -12,6 +12,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from backends import amdgcn_assembly
+from backends import common as backend_common
+
 
 class GateInputError(ValueError):
     """Raised when evaluation evidence is incomplete or malformed."""
@@ -100,12 +103,20 @@ def contract_digest(contract: dict[str, Any]) -> str:
 def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     """Validate a workload contract and return normalized gate parameters."""
 
-    if contract.get("schema_version") != 1:
-        raise GateInputError("contract.schema_version must be 1")
+    try:
+        optimization_surface, legacy_surface = backend_common.contract_surface(contract)
+    except backend_common.BackendContractError as error:
+        raise GateInputError(str(error)) from error
     mode = _nonempty_string(contract.get("mode"), "contract.mode")
     if mode not in {"source", "binary"}:
-        raise GateInputError("contract.mode must be source or binary")
+        raise GateInputError("measured contract.mode must be source or binary")
     target_arch = _nonempty_string(contract.get("target_arch"), "contract.target_arch")
+    if contract.get("schema_version") == 2 and not backend_common.TARGET_ARCH.fullmatch(
+        target_arch
+    ):
+        raise GateInputError(
+            "schema-v2 contract.target_arch must be an explicit gfx target"
+        )
     environment_sha256 = _sha256_string(
         contract.get("environment_sha256"), "contract.environment_sha256"
     )
@@ -191,7 +202,10 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         )
 
     return {
+        "schema_version": contract["schema_version"],
         "mode": mode,
+        "optimization_surface": optimization_surface,
+        "legacy_surface": legacy_surface,
         "target_arch": target_arch,
         "environment_sha256": environment_sha256,
         "case_ids": case_ids,
@@ -213,7 +227,7 @@ def _base_decision(
 ) -> dict[str, Any]:
     artifacts = _mapping(document.get("artifacts"), "artifacts")
     candidate_artifact = artifacts.get("candidate_sha256")
-    return {
+    decision = {
         "schema_version": 1,
         "candidate_id": _nonempty_string(document.get("candidate_id"), "candidate_id"),
         "parent_id": _nonempty_string(document.get("parent_id"), "parent_id"),
@@ -242,17 +256,31 @@ def _base_decision(
         "metrics": {},
         "evidence_sha256": _digest(document),
     }
+    surface = contract.get("optimization_surface")
+    if contract.get("schema_version") == 2:
+        decision["optimization_surface"] = surface
+    return decision
 
 
 def evaluate(document: dict[str, Any]) -> dict[str, Any]:
-    if document.get("schema_version") != 1:
-        raise GateInputError("schema_version must be 1")
+    if document.get("schema_version") not in {1, 2}:
+        raise GateInputError("schema_version must be 1 or 2")
 
     contract = _mapping(document.get("contract"), "contract")
     contract_values = validate_contract(contract)
     decision = _base_decision(document, contract)
     if decision["mode"] != contract_values["mode"]:
         raise GateInputError("mode must match contract.mode")
+    if contract_values["schema_version"] == 2:
+        if document.get("schema_version") != 2:
+            raise GateInputError("schema-v2 contract requires schema-v2 evaluation")
+        if (
+            document.get("optimization_surface")
+            != contract_values["optimization_surface"]
+        ):
+            raise GateInputError(
+                "optimization_surface must match contract.optimization_surface"
+            )
 
     checks = _mapping(document.get("checks"), "checks")
     build = _mapping(checks.get("build"), "checks.build")
@@ -269,19 +297,86 @@ def evaluate(document: dict[str, Any]) -> dict[str, Any]:
     declared_static_required = static.get("required", False)
     if not isinstance(declared_static_required, bool):
         raise GateInputError("checks.static_consistency.required must be boolean")
-    if decision["mode"] == "binary" and declared_static_required is not True:
+    asm_surface = contract_values["optimization_surface"] in backend_common.ASM_SURFACES
+    if (
+        decision["mode"] == "binary" or asm_surface
+    ) and declared_static_required is not True:
         decision["status"] = "static_invalid"
         decision["reasons"] = [
-            "binary mode requires an executed static consistency gate"
+            "binary and ASM surfaces require an executed static consistency gate"
         ]
         return decision
-    static_required = decision["mode"] == "binary" or declared_static_required
+    static_required = (
+        decision["mode"] == "binary" or asm_surface or declared_static_required
+    )
     if static_required and static.get("passed") is not True:
         decision["status"] = "static_invalid"
         decision["reasons"] = [
             "ABI, metadata, descriptor, or resource consistency failed"
         ]
         return decision
+
+    if contract_values["optimization_surface"] == "amdgcn_assembly":
+        asm = _mapping(checks.get("asm_provenance"), "checks.asm_provenance")
+        baseline_artifact = (
+            decision["candidate_id"] == decision["original_id"]
+            and decision["parent_id"] == decision["original_id"]
+            and decision["proposal_sha256"] == decision["artifacts"]["original_sha256"]
+        )
+        try:
+            profile_sha256 = _sha256_string(
+                asm.get("profile_evidence_sha256"),
+                "checks.asm_provenance.profile_evidence_sha256",
+            )
+        except (backend_common.BackendContractError, GateInputError) as error:
+            decision["status"] = "asm_provenance_invalid"
+            decision["reasons"] = [str(error)]
+            return decision
+        artifact_kind = asm.get("artifact_kind")
+        if artifact_kind not in amdgcn_assembly.CODE_OBJECT_KINDS:
+            decision["status"] = "asm_provenance_invalid"
+            decision["reasons"] = ["ASM artifact is not an object or code object"]
+            return decision
+        claim: dict[str, Any] = {"artifact_kind": artifact_kind}
+        required_true = {
+            "native_load_passed": "candidate did not pass the native load path",
+        }
+        if not baseline_artifact:
+            try:
+                claim = amdgcn_assembly.validate_build_claim(
+                    {
+                        "compiled": asm.get("compiled"),
+                        "precompiled_variant": asm.get("precompiled_variant"),
+                        "artifact_kind": artifact_kind,
+                    }
+                )
+            except backend_common.BackendContractError as error:
+                decision["status"] = "asm_provenance_invalid"
+                decision["reasons"] = [str(error)]
+                return decision
+            required_true.update(
+                {
+                    "instruction_diff_nonempty": (
+                        "normalized instruction diff is empty"
+                    ),
+                    "diff_within_declared_windows": (
+                        "instruction diff escapes the proposal's edited windows"
+                    ),
+                }
+            )
+        failures = [
+            reason for key, reason in required_true.items() if asm.get(key) is not True
+        ]
+        if failures:
+            decision["status"] = "asm_provenance_invalid"
+            decision["reasons"] = failures
+            return decision
+        decision["asm_provenance"] = {
+            **claim,
+            "baseline_artifact": baseline_artifact,
+            "profile_evidence_sha256": profile_sha256,
+            **{key: True for key in required_true},
+        }
 
     equivalence = _mapping(document.get("equivalence"), "equivalence")
     cases = equivalence.get("cases")
@@ -445,6 +540,45 @@ def evaluate(document: dict[str, Any]) -> dict[str, Any]:
             )
         ]
         return decision
+
+    if contract_values["optimization_surface"] == "amdgcn_assembly":
+        asm = _mapping(checks.get("asm_provenance"), "checks.asm_provenance")
+        if asm.get("profile_capture_passed") is not True:
+            attempted = asm.get("profile_capture_attempted", False)
+            if not isinstance(attempted, bool):
+                raise GateInputError(
+                    "checks.asm_provenance.profile_capture_attempted must be boolean"
+                )
+            if attempted:
+                decision["status"] = "asm_provenance_invalid"
+                failure = asm.get(
+                    "profile_capture_failure",
+                    "accepted-performance candidate profile capture failed",
+                )
+                decision["reasons"] = [
+                    failure
+                    if isinstance(failure, str) and failure.strip()
+                    else "accepted-performance candidate profile capture failed"
+                ]
+            else:
+                decision["status"] = "profile_required"
+                decision["reasons"] = [
+                    "performance-qualified ASM candidate requires a fresh profile"
+                ]
+            return decision
+        try:
+            candidate_profile_sha256 = _sha256_string(
+                asm.get("candidate_profile_evidence_sha256"),
+                "checks.asm_provenance.candidate_profile_evidence_sha256",
+            )
+        except GateInputError as error:
+            decision["status"] = "asm_provenance_invalid"
+            decision["reasons"] = [str(error)]
+            return decision
+        decision["asm_provenance"]["profile_capture_passed"] = True
+        decision["asm_provenance"]["candidate_profile_evidence_sha256"] = (
+            candidate_profile_sha256
+        )
 
     decision["accepted"] = True
     decision["status"] = "accepted"

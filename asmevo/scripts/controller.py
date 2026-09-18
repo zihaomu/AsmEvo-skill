@@ -26,9 +26,11 @@ from typing import Any
 
 import gate
 import lineage
+from backends import amdgcn_assembly
+from backends import common as backend_common
 
-PROTOCOL = "asmevo.adapter.v1"
-CONTROLLER_POLICY = "controller-v1"
+PROTOCOLS = {1: "asmevo.adapter.v1", 2: "asmevo.adapter.v2"}
+CONTROLLER_POLICIES = {1: "controller-v1", 2: "controller-v2"}
 DEFAULT_TIMEOUT_SECONDS = 600.0
 DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -289,7 +291,11 @@ def _load_initial_context(
     if environment_identity["sha256"] != contract_values["environment_sha256"]:
         raise ControllerError("environment manifest does not match workload contract")
     return {
+        "schema_version": contract_values["schema_version"],
+        "adapter_protocol": PROTOCOLS[contract_values["schema_version"]],
+        "record_policy": CONTROLLER_POLICIES[contract_values["schema_version"]],
         "mode": contract_values["mode"],
+        "optimization_surface": contract_values["optimization_surface"],
         "target_arch": contract_values["target_arch"],
         "case_ids": contract_values["case_ids"],
         "contract": contract,
@@ -317,9 +323,11 @@ def _load_candidate_context(state: Path, parent_id: str | None) -> dict[str, Any
         lineage._verify_preflight(document, contract)
         lineage._verify_controller_baseline(document, contract)
         lineage._verify_controller_attempts(document)
-        if document.get("record_policy") != CONTROLLER_POLICY:
+        contract_values = gate.validate_contract(contract)
+        expected_policy = CONTROLLER_POLICIES[contract_values["schema_version"]]
+        if document.get("record_policy") != expected_policy:
             raise ControllerError(
-                "candidate controller requires a controller-v1 baseline; reinitialize "
+                f"candidate controller requires a {expected_policy} baseline; reinitialize "
                 "the run with controller.py init"
             )
         selected_parent = parent_id or str(document["best_id"])
@@ -329,11 +337,14 @@ def _load_candidate_context(state: Path, parent_id: str | None) -> dict[str, Any
         parent_node = document["nodes"][selected_parent]
         lineage._verify_node_artifact(original_node, "original")
         lineage._verify_node_artifact(parent_node, "parent")
-        contract_values = gate.validate_contract(contract)
         return {
+            "schema_version": contract_values["schema_version"],
+            "adapter_protocol": PROTOCOLS[contract_values["schema_version"]],
+            "record_policy": expected_policy,
             "state": state,
             "lineage": copy.deepcopy(document),
             "mode": contract_values["mode"],
+            "optimization_surface": contract_values["optimization_surface"],
             "target_arch": contract_values["target_arch"],
             "case_ids": contract_values["case_ids"],
             "contract": contract,
@@ -400,6 +411,27 @@ def _verify_frozen_context(
             raise ControllerError(f"adapter is no longer executable: {name}")
         if _sha256(executable) != entry.get("sha256"):
             raise ControllerError(f"adapter changed after preflight: {name}")
+    tools = context["preflight"].get("tools", {})
+    if not isinstance(tools, dict):
+        raise ControllerError("preflight tool identity map is malformed")
+    for name, entry in tools.items():
+        if not isinstance(entry, dict) or entry.get("resolved") is None:
+            continue
+        executable = Path(str(entry.get("resolved")))
+        try:
+            metadata = executable.lstat()
+        except OSError as error:
+            raise ControllerError(
+                f"backend tool is unavailable: {name}: {error}"
+            ) from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or not os.access(executable, os.X_OK)
+        ):
+            raise ControllerError(f"backend tool is no longer executable: {name}")
+        if _sha256(executable) != entry.get("sha256"):
+            raise ControllerError(f"backend tool changed after preflight: {name}")
     if proposal is not None and _sha256(Path(proposal["path"])) != proposal["sha256"]:
         raise ControllerError("proposal snapshot changed during controller execution")
     if (
@@ -417,7 +449,7 @@ def _binding(
     candidate_sha256: str | None,
     correctness_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    binding = {
         "mode": context["mode"],
         "target_arch": context["target_arch"],
         "candidate_id": candidate_id,
@@ -433,6 +465,9 @@ def _binding(
         "case_ids": context["case_ids"],
         "correctness_receipt_sha256": correctness_receipt_sha256,
     }
+    if context["schema_version"] == 2:
+        binding["optimization_surface"] = context["optimization_surface"]
+    return binding
 
 
 def _adapter_entry(context: dict[str, Any], operation: str) -> dict[str, Any]:
@@ -589,8 +624,8 @@ def _invoke_adapter(
     phase_directory.mkdir(mode=0o700)
     request_id = secrets.token_hex(16)
     request = {
-        "schema_version": 1,
-        "protocol": PROTOCOL,
+        "schema_version": context["schema_version"],
+        "protocol": context["adapter_protocol"],
         "request_id": request_id,
         "operation": operation,
         "purpose": purpose,
@@ -633,8 +668,8 @@ def _invoke_adapter(
                 stdout_path.read_bytes(), f"{operation} adapter response"
             )
             if (
-                response.get("schema_version") != 1
-                or response.get("protocol") != PROTOCOL
+                response.get("schema_version") != context["schema_version"]
+                or response.get("protocol") != context["adapter_protocol"]
                 or response.get("request_id") != request_id
                 or response.get("operation") != operation
                 or response.get("binding") != binding
@@ -715,6 +750,57 @@ def _equivalence_from(result: dict[str, Any]) -> dict[str, Any]:
     return equivalence
 
 
+def _load_asm_profile_evidence(
+    path: Path,
+    *,
+    context: dict[str, Any],
+    artifact_sha256: str,
+    within: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    identity = _regular_identity(path, "profile evidence", within=within)
+    document = _load_json(Path(identity["path"]), "profile evidence")
+    if _sha256(Path(identity["path"])) != identity["sha256"]:
+        raise ControllerError("profile evidence changed while it was being loaded")
+    try:
+        amdgcn_assembly.validate_profile_evidence(
+            document,
+            artifact_sha256=artifact_sha256,
+            target_arch=context["target_arch"],
+            contract_sha256=context["contract_sha256"],
+            environment_sha256=context["environment_sha256"],
+        )
+    except backend_common.BackendContractError as error:
+        raise ControllerError(str(error)) from error
+    return identity, document
+
+
+def _asm_static_passed(result: dict[str, Any]) -> bool:
+    response = result.get("response")
+    return bool(
+        result.get("ok")
+        and isinstance(response, dict)
+        and response.get("abi_consistent") is True
+        and response.get("resource_consistent") is True
+    )
+
+
+def _asm_disassembly_claim(result: dict[str, Any]) -> tuple[str, bool, bool]:
+    response = result.get("response")
+    if not result.get("ok") or not isinstance(response, dict):
+        raise ControllerError("ASM disassembly adapter failed")
+    artifact_kind = response.get("artifact_kind")
+    diff = response.get("instruction_diff")
+    if artifact_kind not in amdgcn_assembly.CODE_OBJECT_KINDS:
+        raise ControllerError("ASM disassembly did not identify a code object")
+    if not isinstance(diff, dict):
+        raise ControllerError("ASM disassembly omitted the normalized instruction diff")
+    return (
+        artifact_kind,
+        diff.get("nonempty") is True,
+        diff.get("within_declared_windows") is True,
+    )
+
+
 def _evaluation(
     context: dict[str, Any],
     *,
@@ -727,7 +813,7 @@ def _evaluation(
     provenance: dict[str, Any] | None,
 ) -> dict[str, Any]:
     document: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": context["schema_version"],
         "candidate_id": candidate_id,
         "parent_id": context["parent_id"],
         "original_id": context["original_id"],
@@ -741,6 +827,8 @@ def _evaluation(
         },
         "checks": checks,
     }
+    if context["schema_version"] == 2:
+        document["optimization_surface"] = context["optimization_surface"]
     if equivalence is not None:
         document["equivalence"] = equivalence
     if timing is not None:
@@ -756,9 +844,9 @@ def _correctness_receipt(
     evidence: list[dict[str, Any]],
 ) -> dict[str, Any]:
     artifacts = evaluation["artifacts"]
-    return {
-        "schema_version": 1,
-        "kind": "asmevo.correctness-receipt.v1",
+    receipt = {
+        "schema_version": context["schema_version"],
+        "kind": f"asmevo.correctness-receipt.v{context['schema_version']}",
         "status": "correctness_passed",
         "bindings": {
             "candidate_id": evaluation["candidate_id"],
@@ -780,6 +868,9 @@ def _correctness_receipt(
         "phase_evidence": copy.deepcopy(evidence),
         "issued_at": _now(),
     }
+    if context["schema_version"] == 2:
+        receipt["bindings"]["optimization_surface"] = context["optimization_surface"]
+    return receipt
 
 
 def _correctness_probe(evaluation: dict[str, Any]) -> None:
@@ -1028,6 +1119,115 @@ def initialize_run(
                 "evidence": evidence[3],
             },
         }
+    elif context["optimization_surface"] == "amdgcn_assembly":
+        binding = _binding(
+            context,
+            candidate_id=candidate_id,
+            proposal_sha256=proposal_sha256,
+            candidate_sha256=candidate_identity["sha256"],
+        )
+        disassembly_path = attempt / "baseline-disassembly.json"
+        disassembly = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="disassemble",
+            purpose="baseline",
+            binding=binding,
+            inputs={"candidate_artifact": candidate_identity},
+            outputs={"disassembly_evidence": str(disassembly_path)},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        if not disassembly["ok"]:
+            raise ControllerError(
+                f"baseline disassembly failed: {disassembly['failure']}"
+            )
+        _require_adapter_output(
+            disassembly["response"],
+            disassembly_path,
+            "baseline disassembly evidence",
+            attempt,
+            protected,
+        )
+        disassembly_response = disassembly["response"]
+        artifact_kind = (
+            disassembly_response.get("artifact_kind")
+            if isinstance(disassembly_response, dict)
+            else None
+        )
+        if artifact_kind not in amdgcn_assembly.CODE_OBJECT_KINDS:
+            raise ControllerError("baseline artifact is not a code object")
+        static_result = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="static_check",
+            purpose="baseline",
+            binding=binding,
+            inputs={"candidate_artifact": candidate_identity},
+            outputs={},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        if not _asm_static_passed(static_result):
+            raise ControllerError("baseline ASM ABI/resource check failed")
+        native_load = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="native_load",
+            purpose="baseline",
+            binding=binding,
+            inputs={"candidate_artifact": candidate_identity},
+            outputs={},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        if not native_load["ok"]:
+            raise ControllerError(
+                f"baseline native load failed: {native_load['failure']}"
+            )
+        oracle = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="oracle",
+            purpose="baseline",
+            binding=binding,
+            inputs={"candidate_artifact": candidate_identity},
+            outputs={},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        if not oracle["ok"]:
+            raise ControllerError(f"baseline oracle failed: {oracle['failure']}")
+        equivalence = _equivalence_from(oracle)
+        checks = {
+            "build": {"passed": True, "evidence": "frozen original code object"},
+            "static_consistency": {
+                "required": True,
+                "passed": True,
+                "evidence": evidence[1],
+            },
+            "asm_provenance": {
+                "artifact_kind": artifact_kind,
+                "native_load_passed": True,
+                "profile_capture_passed": False,
+                "profile_evidence_sha256": "0" * 64,
+            },
+        }
+        correctness_only = _evaluation(
+            context,
+            candidate_id=candidate_id,
+            proposal_sha256=proposal_sha256,
+            candidate_sha256=candidate_identity["sha256"],
+            checks=checks,
+            equivalence=equivalence,
+            timing={"valid": False, "invalid_reason": "profile not authorized yet"},
+            provenance=None,
+        )
+        _correctness_probe(correctness_only)
     else:
         binding = _binding(
             context,
@@ -1108,9 +1308,40 @@ def initialize_run(
         context["contract_values"],
     )
     _verify_frozen_context(context, candidate=candidate_identity)
+    baseline_profile_identity: dict[str, Any] | None = None
+    if context["optimization_surface"] == "amdgcn_assembly":
+        profile_path = attempt / "baseline-profile.json"
+        profile = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="profile",
+            purpose="baseline-after-benchmark",
+            binding=binding,
+            inputs={"candidate_artifact": candidate_identity},
+            outputs={"profile_evidence": str(profile_path)},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        if not profile["ok"]:
+            raise ControllerError(f"baseline profile failed: {profile['failure']}")
+        baseline_profile_identity = _require_adapter_output(
+            profile["response"],
+            profile_path,
+            "baseline profile evidence",
+            attempt,
+            protected,
+        )
+        _load_asm_profile_evidence(
+            profile_path,
+            context=context,
+            artifact_sha256=candidate_identity["sha256"],
+            within=attempt,
+        )
+        _verify_frozen_context(context, candidate=candidate_identity)
     baseline_receipt = {
-        "schema_version": 1,
-        "kind": "asmevo.baseline-receipt.v1",
+        "schema_version": context["schema_version"],
+        "kind": f"asmevo.baseline-receipt.v{context['schema_version']}",
         "status": "verified",
         "bindings": {
             "original_id": original_id,
@@ -1128,6 +1359,15 @@ def initialize_run(
         "phase_evidence": evidence,
         "issued_at": _now(),
     }
+    if baseline_profile_identity is not None:
+        baseline_receipt["post_benchmark_profile"] = {
+            "captured": True,
+            "profile_evidence_sha256": baseline_profile_identity["sha256"],
+        }
+    if context["schema_version"] == 2:
+        baseline_receipt["bindings"]["optimization_surface"] = context[
+            "optimization_surface"
+        ]
     baseline_receipt_path = attempt / "baseline-receipt.json"
     _atomic_write_json(baseline_receipt_path, baseline_receipt)
     try:
@@ -1144,7 +1384,7 @@ def initialize_run(
         )
     except lineage.LineageError as error:
         raise ControllerError(str(error)) from error
-    return {
+    result = {
         "initialized": True,
         "status": "baseline_verified",
         "record_policy": initialized["record_policy"],
@@ -1153,6 +1393,10 @@ def initialize_run(
         "baseline_receipt_sha256": _document_digest(baseline_receipt),
         "baseline_median_ms": median,
     }
+    if baseline_profile_identity is not None:
+        result["baseline_profile"] = baseline_profile_identity["path"]
+        result["baseline_profile_sha256"] = baseline_profile_identity["sha256"]
+    return result
 
 
 def evaluate_candidate(
@@ -1165,15 +1409,56 @@ def evaluate_candidate(
     changed_windows: list[str],
     parent_id: str | None = None,
     artifact_name: str = "candidate.artifact",
+    profile_evidence_path: Path | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
 ) -> dict[str, Any]:
     _validate_limits(timeout_seconds, max_output_bytes)
     candidate_id = _safe_id(candidate_id, "candidate ID")
-    artifact_name = _safe_artifact_name(artifact_name)
     if not edit_summary.strip():
         raise ControllerError("edit summary must not be empty")
     context = _load_candidate_context(state, parent_id)
+    asm_surface = context["optimization_surface"] == "amdgcn_assembly"
+    if asm_surface and artifact_name == "candidate.artifact":
+        artifact_name = "candidate.hsaco"
+    artifact_name = _safe_artifact_name(artifact_name)
+    asm_proposal: dict[str, Any] | None = None
+    raw_asm_proposal: dict[str, Any] | None = None
+    asm_source_path: Path | None = None
+    asm_source_identity: dict[str, Any] | None = None
+    parent_profile_identity: dict[str, Any] | None = None
+    if asm_surface:
+        if profile_evidence_path is None:
+            raise ControllerError(
+                "amdgcn_assembly candidates require --profile-evidence"
+            )
+        parent_profile_identity, _ = _load_asm_profile_evidence(
+            profile_evidence_path,
+            context=context,
+            artifact_sha256=context["parent"]["sha256"],
+        )
+        raw_asm_proposal = _load_json(proposal_path.resolve(), "ASM proposal")
+        try:
+            asm_proposal = amdgcn_assembly.validate_proposal(
+                raw_asm_proposal,
+                parent_sha256=context["parent"]["sha256"],
+                profile_evidence_sha256=parent_profile_identity["sha256"],
+            )
+        except backend_common.BackendContractError as error:
+            raise ControllerError(str(error)) from error
+        asm_source_path = Path(asm_proposal["source_path"])
+        if not asm_source_path.is_absolute():
+            asm_source_path = proposal_path.resolve().parent / asm_source_path
+        asm_source_identity = _regular_identity(asm_source_path, "ASM candidate source")
+        proposal_windows = [
+            f"{window['start_pc']}:{window['end_pc']}"
+            for window in asm_proposal["edited_windows"]
+        ]
+        if changed_windows and changed_windows != proposal_windows:
+            raise ControllerError(
+                "--changed-window values do not match the ASM proposal"
+            )
+        changed_windows = proposal_windows
     if candidate_id in context["lineage"]["nodes"] or any(
         attempt.get("candidate_id") == candidate_id
         for attempt in context["lineage"]["attempts"]
@@ -1181,6 +1466,31 @@ def evaluate_candidate(
         raise ControllerError(f"candidate ID already exists: {candidate_id}")
     attempt = _new_attempt_directory(run_dir, candidate_id)
     proposal = _snapshot_proposal(proposal_path, attempt / "proposal.snapshot")
+    asm_source: dict[str, Any] | None = None
+    parent_profile: dict[str, Any] | None = None
+    if asm_surface:
+        assert asm_source_path is not None
+        assert asm_source_identity is not None
+        assert parent_profile_identity is not None
+        assert raw_asm_proposal is not None
+        if (
+            _load_json(Path(proposal["path"]), "ASM proposal snapshot")
+            != raw_asm_proposal
+        ):
+            raise ControllerError("ASM proposal changed while it was being snapshotted")
+        asm_source = _snapshot_proposal(asm_source_path, attempt / "candidate.s")
+        if asm_source["sha256"] != asm_source_identity["sha256"]:
+            raise ControllerError(
+                "ASM candidate source changed while it was being snapshotted"
+            )
+        parent_profile = _snapshot_proposal(
+            Path(parent_profile_identity["path"]),
+            attempt / "parent-profile.snapshot.json",
+        )
+        if parent_profile["sha256"] != parent_profile_identity["sha256"]:
+            raise ControllerError(
+                "parent profile evidence changed while it was being snapshotted"
+            )
     if any(
         node.get("proposal_sha256") == proposal["sha256"]
         for node in context["lineage"]["nodes"].values()
@@ -1201,13 +1511,21 @@ def evaluate_candidate(
         proposal_sha256=proposal["sha256"],
         candidate_sha256=None,
     )
+    build_inputs: dict[str, Any] = {"proposal": proposal}
+    if asm_surface:
+        build_inputs.update(
+            {
+                "candidate_source": asm_source,
+                "parent_profile_evidence": parent_profile,
+            }
+        )
     build = _invoke_adapter(
         context,
         attempt_directory=attempt,
         operation=build_operation,
         purpose="candidate",
         binding=initial_binding,
-        inputs={"proposal": proposal},
+        inputs=build_inputs,
         outputs={"candidate_artifact": str(candidate_path)},
         evidence=evidence,
         timeout_seconds=timeout_seconds,
@@ -1225,9 +1543,9 @@ def evaluate_candidate(
             equivalence=None,
             timing=None,
             provenance={
-                "schema_version": 1,
+                "schema_version": context["schema_version"],
                 "producer": "asmevo-controller",
-                "record_policy": CONTROLLER_POLICY,
+                "record_policy": context["record_policy"],
                 "stage": "correctness_rejected",
                 "phase_evidence": evidence,
             },
@@ -1250,6 +1568,12 @@ def evaluate_candidate(
     response = build["response"]
     if response.get("candidate_sha256") != candidate["sha256"]:
         raise ControllerError("candidate hash does not match build adapter response")
+    asm_build_claim: dict[str, Any] | None = None
+    if asm_surface:
+        try:
+            asm_build_claim = amdgcn_assembly.validate_build_claim(response)
+        except backend_common.BackendContractError as error:
+            raise ControllerError(str(error)) from error
     _verify_frozen_context(context, proposal=proposal, candidate=candidate)
     binding = _binding(
         context,
@@ -1257,7 +1581,7 @@ def evaluate_candidate(
         proposal_sha256=proposal["sha256"],
         candidate_sha256=candidate["sha256"],
     )
-    checks = {
+    checks: dict[str, Any] = {
         "build": {"passed": True, "evidence": evidence[-1]},
         "static_consistency": {
             "required": context["mode"] == "binary",
@@ -1265,7 +1589,139 @@ def evaluate_candidate(
             "evidence": "not required in source mode",
         },
     }
-    if context["mode"] == "binary":
+    if asm_surface:
+        disassembly_path = attempt / "candidate-disassembly.json"
+        disassembly = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="disassemble",
+            purpose="candidate",
+            binding=binding,
+            inputs={
+                "candidate_artifact": candidate,
+                "parent_artifact": context["parent"],
+                "proposal": proposal,
+            },
+            outputs={"disassembly_evidence": str(disassembly_path)},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        if not disassembly["ok"]:
+            raise ControllerError(
+                f"candidate disassembly failed: {disassembly['failure']}"
+            )
+        _require_adapter_output(
+            disassembly["response"],
+            disassembly_path,
+            "candidate disassembly evidence",
+            attempt,
+            protected,
+        )
+        artifact_kind, diff_nonempty, diff_in_windows = _asm_disassembly_claim(
+            disassembly
+        )
+        if asm_build_claim is None or artifact_kind != asm_build_claim["artifact_kind"]:
+            raise ControllerError("build and disassembly disagree on artifact kind")
+        static_result = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="static_check",
+            purpose="candidate",
+            binding=binding,
+            inputs={
+                "candidate_artifact": candidate,
+                "parent_artifact": context["parent"],
+                "disassembly_evidence": _regular_identity(
+                    disassembly_path,
+                    "candidate disassembly evidence",
+                    within=attempt,
+                ),
+            },
+            outputs={},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        static_passed = _asm_static_passed(static_result)
+        checks["static_consistency"] = {
+            "required": True,
+            "passed": static_passed,
+            "evidence": evidence[-1],
+        }
+        checks["asm_provenance"] = {
+            **asm_build_claim,
+            "profile_evidence_sha256": parent_profile["sha256"],
+            "instruction_diff_nonempty": diff_nonempty,
+            "diff_within_declared_windows": diff_in_windows,
+            "native_load_passed": False,
+            "profile_capture_passed": False,
+        }
+        if not static_passed:
+            evaluation = _evaluation(
+                context,
+                candidate_id=candidate_id,
+                proposal_sha256=proposal["sha256"],
+                candidate_sha256=candidate["sha256"],
+                checks=checks,
+                equivalence=None,
+                timing=None,
+                provenance={
+                    "schema_version": context["schema_version"],
+                    "producer": "asmevo-controller",
+                    "record_policy": context["record_policy"],
+                    "stage": "correctness_rejected",
+                    "phase_evidence": evidence,
+                },
+            )
+            return _record_candidate(
+                context,
+                attempt_directory=attempt,
+                evaluation=evaluation,
+                candidate=candidate_path,
+                edit_summary=edit_summary,
+                changed_windows=changed_windows,
+            )
+        native_load = _invoke_adapter(
+            context,
+            attempt_directory=attempt,
+            operation="native_load",
+            purpose="candidate",
+            binding=binding,
+            inputs={"candidate_artifact": candidate},
+            outputs={},
+            evidence=evidence,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        checks["asm_provenance"]["native_load_passed"] = native_load["ok"]
+        if not native_load["ok"]:
+            evaluation = _evaluation(
+                context,
+                candidate_id=candidate_id,
+                proposal_sha256=proposal["sha256"],
+                candidate_sha256=candidate["sha256"],
+                checks=checks,
+                equivalence=None,
+                timing=None,
+                provenance={
+                    "schema_version": context["schema_version"],
+                    "producer": "asmevo-controller",
+                    "record_policy": context["record_policy"],
+                    "stage": "correctness_rejected",
+                    "phase_evidence": evidence,
+                },
+            )
+            return _record_candidate(
+                context,
+                attempt_directory=attempt,
+                evaluation=evaluation,
+                candidate=candidate_path,
+                edit_summary=edit_summary,
+                changed_windows=changed_windows,
+            )
+        _verify_frozen_context(context, proposal=proposal, candidate=candidate)
+    elif context["mode"] == "binary":
         static_result = _invoke_adapter(
             context,
             attempt_directory=attempt,
@@ -1293,9 +1749,9 @@ def evaluate_candidate(
                 equivalence=None,
                 timing=None,
                 provenance={
-                    "schema_version": 1,
+                    "schema_version": context["schema_version"],
                     "producer": "asmevo-controller",
-                    "record_policy": CONTROLLER_POLICY,
+                    "record_policy": context["record_policy"],
                     "stage": "correctness_rejected",
                     "phase_evidence": evidence,
                 },
@@ -1416,9 +1872,9 @@ def evaluate_candidate(
         raise ControllerError(f"invalid correctness evidence: {error}") from error
     if prefix_decision["status"] != "timing_invalid":
         prefix["provenance"] = {
-            "schema_version": 1,
+            "schema_version": context["schema_version"],
             "producer": "asmevo-controller",
-            "record_policy": CONTROLLER_POLICY,
+            "record_policy": context["record_policy"],
             "stage": "correctness_rejected",
             "phase_evidence": evidence,
         }
@@ -1436,6 +1892,11 @@ def evaluate_candidate(
     _atomic_write_json(receipt_path, receipt)
     receipt_sha256 = _document_digest(receipt)
     _verify_frozen_context(context, proposal=proposal, candidate=candidate)
+    if asm_surface:
+        assert asm_source is not None
+        assert parent_profile is not None
+        _verify_identity(asm_source, "ASM candidate source", attempt)
+        _verify_identity(parent_profile, "parent profile evidence", attempt)
     benchmark_binding = _binding(
         context,
         candidate_id=candidate_id,
@@ -1466,6 +1927,9 @@ def evaluate_candidate(
         max_output_bytes=max_output_bytes,
     )
     _verify_frozen_context(context, proposal=proposal, candidate=candidate)
+    if asm_surface:
+        _verify_identity(asm_source, "ASM candidate source", attempt)
+        _verify_identity(parent_profile, "parent profile evidence", attempt)
     if benchmark["ok"]:
         response = benchmark["response"]
         timing = response.get("timing") if isinstance(response, dict) else None
@@ -1477,9 +1941,9 @@ def evaluate_candidate(
             "invalid_reason": f"benchmark adapter failed: {benchmark['failure']}",
         }
     provenance = {
-        "schema_version": 1,
+        "schema_version": context["schema_version"],
         "producer": "asmevo-controller",
-        "record_policy": CONTROLLER_POLICY,
+        "record_policy": context["record_policy"],
         "stage": "benchmarked",
         "correctness_receipt_sha256": receipt_sha256,
         "correctness_receipt": receipt,
@@ -1495,7 +1959,59 @@ def evaluate_candidate(
         timing=timing,
         provenance=provenance,
     )
-    return _record_candidate(
+    candidate_profile_path: Path | None = None
+    if asm_surface:
+        try:
+            preliminary = gate.evaluate(evaluation)
+        except gate.GateInputError as error:
+            raise ControllerError(f"invalid benchmark evidence: {error}") from error
+        if preliminary["status"] == "profile_required":
+            candidate_profile_path = attempt / "candidate-profile.json"
+            candidate_profile = _invoke_adapter(
+                context,
+                attempt_directory=attempt,
+                operation="profile",
+                purpose="accepted-candidate",
+                binding=binding,
+                inputs={"candidate_artifact": candidate},
+                outputs={"profile_evidence": str(candidate_profile_path)},
+                evidence=evidence,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+            )
+            checks["asm_provenance"]["profile_capture_attempted"] = True
+            if not candidate_profile["ok"]:
+                checks["asm_provenance"]["profile_capture_passed"] = False
+                checks["asm_provenance"]["profile_capture_failure"] = (
+                    "candidate profile failed: " + str(candidate_profile["failure"])
+                )
+            else:
+                candidate_profile_identity = _require_adapter_output(
+                    candidate_profile["response"],
+                    candidate_profile_path,
+                    "candidate profile evidence",
+                    attempt,
+                    protected,
+                )
+                _load_asm_profile_evidence(
+                    candidate_profile_path,
+                    context=context,
+                    artifact_sha256=candidate["sha256"],
+                    within=attempt,
+                )
+                checks["asm_provenance"]["profile_capture_passed"] = True
+                checks["asm_provenance"]["candidate_profile_evidence_sha256"] = (
+                    candidate_profile_identity["sha256"]
+                )
+                _verify_identity(
+                    candidate_profile_identity,
+                    "candidate profile evidence",
+                    attempt,
+                )
+            provenance["phase_evidence"] = evidence
+            evaluation["checks"] = checks
+            evaluation["provenance"] = provenance
+    recorded = _record_candidate(
         context,
         attempt_directory=attempt,
         evaluation=evaluation,
@@ -1503,6 +2019,17 @@ def evaluate_candidate(
         edit_summary=edit_summary,
         changed_windows=changed_windows,
     )
+    if (
+        asm_surface
+        and recorded.get("accepted") is True
+        and candidate_profile_path is not None
+        and checks.get("asm_provenance", {}).get("profile_capture_passed") is True
+    ):
+        recorded["candidate_profile"] = str(candidate_profile_path.resolve())
+        recorded["candidate_profile_sha256"] = checks["asm_provenance"][
+            "candidate_profile_evidence_sha256"
+        ]
+    return recorded
 
 
 def main() -> int:
@@ -1531,6 +2058,11 @@ def main() -> int:
     evaluate_parser.add_argument("--candidate-id", required=True)
     evaluate_parser.add_argument("--parent-id")
     evaluate_parser.add_argument("--proposal", type=Path, required=True)
+    evaluate_parser.add_argument(
+        "--profile-evidence",
+        type=Path,
+        help="verified parent profile evidence required by amdgcn_assembly",
+    )
     evaluate_parser.add_argument("--artifact-name", default="candidate.artifact")
     evaluate_parser.add_argument("--edit-summary", required=True)
     evaluate_parser.add_argument("--changed-window", action="append", default=[])
@@ -1579,6 +2111,7 @@ def main() -> int:
                 candidate_id=args.candidate_id,
                 parent_id=args.parent_id,
                 proposal_path=args.proposal,
+                profile_evidence_path=args.profile_evidence,
                 artifact_name=args.artifact_name,
                 edit_summary=args.edit_summary,
                 changed_windows=args.changed_window,

@@ -23,6 +23,18 @@ def evaluation() -> dict:
 
 
 class GateTests(unittest.TestCase):
+    def test_schema_v1_remains_readable_without_surface_inference(self) -> None:
+        document = evaluation()
+        document["schema_version"] = 1
+        document["contract"]["schema_version"] = 1
+        document.pop("optimization_surface")
+        document["contract"].pop("optimization_surface")
+
+        decision = gate.evaluate(document)
+
+        self.assertTrue(decision["accepted"])
+        self.assertNotIn("optimization_surface", decision)
+
     def test_accepts_correct_stable_improvement(self) -> None:
         decision = gate.evaluate(evaluation())
 
@@ -56,6 +68,8 @@ class GateTests(unittest.TestCase):
         document = evaluation()
         document["mode"] = "binary"
         document["contract"]["mode"] = "binary"
+        document["optimization_surface"] = "hsaco_binary"
+        document["contract"]["optimization_surface"] = "hsaco_binary"
         document["checks"]["static_consistency"] = {"passed": False}
 
         decision = gate.evaluate(document)
@@ -66,6 +80,8 @@ class GateTests(unittest.TestCase):
         document = evaluation()
         document["mode"] = "binary"
         document["contract"]["mode"] = "binary"
+        document["optimization_surface"] = "hsaco_binary"
+        document["contract"]["optimization_surface"] = "hsaco_binary"
         document["checks"]["static_consistency"] = {
             "required": False,
             "passed": True,
@@ -134,6 +150,60 @@ class GateTests(unittest.TestCase):
 
         self.assertEqual(decision["status"], "insufficient_speedup")
         self.assertFalse(decision["accepted"])
+
+    def test_asm_candidate_requires_post_benchmark_profile(self) -> None:
+        document = evaluation()
+        document["optimization_surface"] = "amdgcn_assembly"
+        document["contract"]["optimization_surface"] = "amdgcn_assembly"
+        document["checks"]["static_consistency"]["required"] = True
+        document["checks"]["asm_provenance"] = {
+            "compiled": True,
+            "precompiled_variant": False,
+            "artifact_kind": "hsaco",
+            "profile_evidence_sha256": "3" * 64,
+            "instruction_diff_nonempty": True,
+            "diff_within_declared_windows": True,
+            "native_load_passed": True,
+            "profile_capture_passed": False,
+        }
+
+        decision = gate.evaluate(document)
+        self.assertEqual(decision["status"], "profile_required")
+
+        document["checks"]["asm_provenance"].update(
+            {
+                "profile_capture_attempted": True,
+                "profile_capture_passed": True,
+                "candidate_profile_evidence_sha256": "4" * 64,
+            }
+        )
+        decision = gate.evaluate(document)
+        self.assertTrue(decision["accepted"])
+        self.assertEqual(decision["status"], "accepted")
+
+    def test_asm_profile_failure_is_not_accepted(self) -> None:
+        document = evaluation()
+        document["optimization_surface"] = "amdgcn_assembly"
+        document["contract"]["optimization_surface"] = "amdgcn_assembly"
+        document["checks"]["static_consistency"]["required"] = True
+        document["checks"]["asm_provenance"] = {
+            "compiled": True,
+            "precompiled_variant": False,
+            "artifact_kind": "hsaco",
+            "profile_evidence_sha256": "3" * 64,
+            "instruction_diff_nonempty": True,
+            "diff_within_declared_windows": True,
+            "native_load_passed": True,
+            "profile_capture_attempted": True,
+            "profile_capture_passed": False,
+            "profile_capture_failure": "profiler crashed",
+        }
+
+        decision = gate.evaluate(document)
+
+        self.assertFalse(decision["accepted"])
+        self.assertEqual(decision["status"], "asm_provenance_invalid")
+        self.assertEqual(decision["reasons"], ["profiler crashed"])
 
     def test_input_is_not_mutated(self) -> None:
         document = evaluation()
