@@ -14,6 +14,8 @@ skill fails closed when they are unavailable.
 ## What it provides
 
 - source, binary, and audit operating modes;
+- machine-checkable optimization surfaces that distinguish launch/source tuning,
+  true AMDGCN assembly, deferred HSACO rewriting, and audit-only work;
 - a fixed controller state machine that invokes project adapters directly;
 - hash-bound preflight, workload, environment, artifact, and receipt identities;
 - correctness receipts that authorize benchmarking only after every frozen case
@@ -24,8 +26,12 @@ skill fails closed when they are unavailable.
 - contracts for recovery, round-trip, metadata-aware rebuild, replay, and native
   path validation;
 - a profiling-guided AMDGCN optimization playbook.
+- generic capability probing, fresh `.s` assembly/link, normalized disassembly,
+  instruction-window diff, resource scanning, and profile-evidence helpers.
 
-The four Python helpers use only the Linux Python standard library:
+The Python helpers use only the Linux Python standard library. The controller
+path is authoritative; the other tools produce inputs or independently
+inspectable evidence:
 
 - `preflight.py` records artifact identity, checks required capabilities, and
   distinguishes a visible device node from a verified target architecture;
@@ -35,6 +41,9 @@ The four Python helpers use only the Linux Python standard library:
 - `lineage.py` locks and records lineage state. Its public `init` and `record`
   commands are legacy low-level interfaces and do not create controller-bound
   evidence.
+- `capability_probe.py`, `assemble.py`, `disassemble.py`,
+  `code_object_diff.py`, `resource_check.py`, and `profile.py` implement the
+  reusable parts of the v2 AMDGCN source-assembly backend.
 
 Runtime requirements are Linux and Python 3.10 or newer.
 
@@ -85,6 +94,14 @@ the rebuilt round-trip artifact during initialization and the candidate during
 evaluation, and `compare` checks those observations against the K0 oracle output.
 See [`controller-contract.md`](asmevo/references/controller-contract.md) for the
 commands and receipt lifecycle.
+
+For true AMDGCN assembly, use a schema-v2 contract with
+`optimization_surface: amdgcn_assembly`. The project supplies its fixed launcher,
+kernarg/ABI rules, native load, reference, workload, and benchmark adapters. The
+skill requires a real fresh code object, a non-empty in-window instruction diff,
+ABI/resource consistency, correctness-before-benchmark, and a new profile before
+promotion. Operator-specific or machine-private integration does not belong in
+this repository.
 
 ## Validate
 

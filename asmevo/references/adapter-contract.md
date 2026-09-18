@@ -8,6 +8,11 @@ directly executable, deterministic where possible, and independently reviewed.
 
 Source mode requires `build`, `oracle`, and `benchmark`.
 
+The schema-v2 `amdgcn_assembly` surface requires `build`, `disassemble`,
+`static_check`, `native_load`, `oracle`, `profile`, and `benchmark`. Read
+[assembly-backend.md](assembly-backend.md) and
+[profiling-contract.md](profiling-contract.md) before implementing it.
+
 Binary mode requires `recover`, `roundtrip`, `rebuild`, `static_check`, `oracle`,
 `replay`, `compare`, and `benchmark`. Their semantic duties are described in
 [binary-backend.md](binary-backend.md).
@@ -62,6 +67,11 @@ The common request envelope is:
 }
 ```
 
+Schema-v2 requests use `schema_version: 2`, protocol `asmevo.adapter.v2`, and
+include the frozen `optimization_surface` in `binding`. Responses must echo the
+same schema, protocol, and binding. Schema-v1 evidence remains readable but has
+no inferred optimization surface.
+
 The common response envelope is:
 
 ```json
@@ -84,8 +94,20 @@ adapter declaration. It never accepts an adapter-selected output path.
 
 - `build` and `rebuild` write `outputs.candidate_artifact` and return its
   `candidate_sha256`.
+- An `amdgcn_assembly` `build` additionally returns `compiled: true`,
+  `precompiled_variant: false`, and a real `artifact_kind` (`elf_object`,
+  `code_object`, or `hsaco`).
 - `recover` writes `outputs.recovered` and returns `output_sha256`.
 - `roundtrip` and `static_check` return the common envelope; `ok` is the verdict.
+- Assembly `disassemble` writes `outputs.disassembly_evidence`, returns its
+  `output_sha256`, binds the artifact kind, and returns a non-empty normalized
+  `instruction_diff` with an explicit in-window verdict.
+- Assembly `static_check` returns both `abi_consistent` and
+  `resource_consistent`; both must be true. `native_load` must exercise the
+  project's real launcher path, not only a standalone parser.
+- `profile` writes `outputs.profile_evidence` and returns `output_sha256`. Its
+  document must satisfy the v2 profiling contract and bind the artifact in the
+  request.
 - A binary `oracle` or `replay` writes `outputs.observations` and returns
   `output_sha256`.
 - A source `oracle`, and binary `compare`, return `equivalence.cases` in the exact

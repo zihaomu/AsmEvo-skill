@@ -6,6 +6,7 @@ Use one primary status per candidate and retain detailed sub-reasons.
 |---|---|---|
 | `build_invalid` | source, assembly, link, or code-object build failed | fix syntax/tool use or abandon the edit; do not time |
 | `static_invalid` | ABI, descriptor, metadata, resource, symbol, or launch contract mismatch | reject; return to verified parent |
+| `asm_provenance_invalid` | an ASM claim lacks a fresh build, in-window instruction diff, native load, or required profile identity | reject the ASM claim; repair the missing evidence rather than relabeling it |
 | `runtime_failure` | launch, device, timeout, or replay failed before a valid comparison | distinguish candidate failure from infrastructure failure |
 | `canary_corruption` | an output guard or protected memory canary changed | reject immediately; inspect bounds and pointer arithmetic |
 | `divergent` | numeric or exact-state comparison failed | reject the semantic edit; do not relax policy |
@@ -17,6 +18,11 @@ Use one primary status per candidate and retain detailed sub-reasons.
 | `controller_error` | the controller cannot complete a bound phase because an adapter timed out, violated the protocol, returned malformed evidence, or a frozen identity/receipt changed | fail closed; do not benchmark or promote, inspect the preserved phase evidence, and retry only after identifying an infrastructure cause |
 | `infrastructure_error` | remote host, storage, profiler, or orchestration failed independently of candidate semantics | bounded retry is allowed |
 | `input_invalid` | evaluation JSON is malformed, including missing, non-finite, non-positive, or insufficient timing samples | repair the evidence producer; CLI exits nonzero and no attempt is recorded |
+
+`profile_required` is an internal controller transition, not a terminal candidate
+result. It means correctness and timing qualify an ASM candidate for the fresh
+profile that must complete before acceptance. Lineage rejects an attempt that
+tries to record this unfinished state.
 
 ## Classification rules
 
