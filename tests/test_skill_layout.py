@@ -99,6 +99,10 @@ class SkillLayoutTests(unittest.TestCase):
         self.assertIn('display_name: "AsmEvo"', contents)
         self.assertIn("$asmevo", contents)
 
+    def test_import_only_helpers_do_not_claim_cli_entry_points(self) -> None:
+        contents = (SKILL / "scripts" / "target_context.py").read_text(encoding="utf-8")
+        self.assertFalse(contents.startswith("#!"))
+
     def test_release_versions_match_and_controller_is_executable(self) -> None:
         root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         skill_version = (SKILL / "VERSION").read_text(encoding="utf-8").strip()

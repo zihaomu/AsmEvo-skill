@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Resolve exact AMDGPU targets and bind compact software-stack context."""
 
 from __future__ import annotations
