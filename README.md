@@ -25,7 +25,9 @@ skill fails closed when they are unavailable.
 - variance-aware performance acceptance from raw samples;
 - contracts for recovery, round-trip, metadata-aware rebuild, replay, and native
   path validation;
-- a profiling-guided AMDGCN optimization playbook.
+- a profiling-guided AMDGCN optimization playbook;
+- exact-target architecture routing with compact RDNA 3.5, RDNA 4, and CDNA 5
+  proposal cards;
 - generic capability probing, fresh `.s` assembly/link, normalized disassembly,
   instruction-window diff, resource scanning, and profile-evidence helpers.
 
@@ -41,9 +43,30 @@ inspectable evidence:
 - `lineage.py` locks and records lineage state. Its public `init` and `record`
   commands are legacy low-level interfaces and do not create controller-bound
   evidence.
-- `capability_probe.py`, `assemble.py`, `disassemble.py`,
+- `capability_probe.py`, `target_context.py`, `assemble.py`, `disassemble.py`,
   `code_object_diff.py`, `resource_check.py`, and `profile.py` implement the
   reusable parts of the v2 AMDGCN source-assembly backend.
+
+Architecture lookup is deliberately exact rather than prefix-based. In
+particular, `gfx1201` routes to RDNA 4 while `gfx1250` routes to CDNA 5. Unknown
+targets stay on the generic measured playbook instead of being guessed. The
+capability and preflight reports also keep declared ROCm component versions
+separate from observed tool paths and hashes. This context can improve candidate
+selection, but it never replaces native loading, correctness, or benchmarking.
+
+Record component versions when they are known:
+
+```bash
+python3 asmevo/scripts/capability_probe.py \
+  --target-arch gfx1201 --detected-arch gfx1201 \
+  --optimization-surface amdgcn_assembly \
+  --component rocm=10.0 --component llvm=24 \
+  --tool assembler=/opt/rocm/bin/clang \
+  --tool linker=/opt/rocm/bin/ld.lld \
+  --tool objdump=/opt/rocm/bin/llvm-objdump \
+  --tool profiler=/opt/rocm/bin/rocprofv3 \
+  --native-load
+```
 
 Runtime requirements are Linux and Python 3.10 or newer.
 

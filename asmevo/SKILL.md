@@ -88,6 +88,17 @@ not prove the requested architecture. If the project lacks a command contract,
 read [references/adapter-contract.md](references/adapter-contract.md) and create
 the smallest project-local adapter needed for the requested run.
 
+For architecture-sensitive proposals, read
+[references/architecture-and-rocm-context.md](references/architecture-and-rocm-context.md).
+Resolve `assets/architectures/targets.json` by exact target only, then load the
+single referenced architecture card. Never classify RDNA or CDNA from a `gfx`
+prefix: `gfx1201` is routed to RDNA 4 while `gfx1250` is routed to CDNA 5. If no
+exact entry exists, use only the generic measured playbook. Record observable
+ROCm, HIP, LLVM, ROCr, profiler, driver, firmware, and code-object labels with
+repeated `--component NAME=VERSION` arguments; treat those labels as context, not
+compatibility proof. Architecture knowledge may shape proposals but cannot
+change assembly, correctness, native-load, benchmark, or promotion gates.
+
 For real-dispatch captures, treat kernargs and device-memory snapshots as sensitive
 data. Keep them in an authorized private workspace and never commit them.
 

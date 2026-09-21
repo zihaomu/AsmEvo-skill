@@ -26,6 +26,7 @@ class SkillLayoutTests(unittest.TestCase):
             "scripts/lineage.py",
             "scripts/preflight.py",
             "scripts/capability_probe.py",
+            "scripts/target_context.py",
             "scripts/assemble.py",
             "scripts/disassemble.py",
             "scripts/code_object_diff.py",
@@ -43,6 +44,10 @@ class SkillLayoutTests(unittest.TestCase):
             "references/failure-taxonomy.md",
             "references/optimization-playbook.md",
             "references/profiling-contract.md",
+            "references/architecture-and-rocm-context.md",
+            "references/architectures/rdna35.md",
+            "references/architectures/rdna4.md",
+            "references/architectures/cdna5.md",
             "assets/evaluation-template.json",
             "assets/contract-template.json",
             "assets/example-environment.json",
@@ -51,6 +56,7 @@ class SkillLayoutTests(unittest.TestCase):
             "assets/schemas/profile-evidence.schema.json",
             "assets/architectures/gfx11.json",
             "assets/architectures/gfx12.json",
+            "assets/architectures/targets.json",
         ]
         for relative in expected:
             with self.subTest(relative=relative):
@@ -93,11 +99,15 @@ class SkillLayoutTests(unittest.TestCase):
         self.assertIn('display_name: "AsmEvo"', contents)
         self.assertIn("$asmevo", contents)
 
+    def test_import_only_helpers_do_not_claim_cli_entry_points(self) -> None:
+        contents = (SKILL / "scripts" / "target_context.py").read_text(encoding="utf-8")
+        self.assertFalse(contents.startswith("#!"))
+
     def test_release_versions_match_and_controller_is_executable(self) -> None:
         root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         skill_version = (SKILL / "VERSION").read_text(encoding="utf-8").strip()
 
-        self.assertEqual(root_version, "0.3.0.0")
+        self.assertEqual(root_version, "0.4.0.0")
         self.assertEqual(skill_version, root_version)
         for script in (
             "controller.py",

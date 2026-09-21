@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0.0 - 2026-09-21
+
+- Route supported `gfx` targets through an exact-match registry so RDNA 3.5,
+  RDNA 4, and CDNA 5 proposal guidance can be loaded without treating
+  `gfx1250` as RDNA 4.
+- Bind the architecture registry, selected knowledge card, declared ROCm
+  component versions, and observed tool identities into capability and
+  preflight reports.
+- Keep unknown targets on the generic measured playbook and make architecture
+  knowledge proposal-only; native load, correctness, benchmark, and promotion
+  gates remain authoritative.
+- Add compact architecture cards, component-capture guidance, and regression
+  tests for exact routing, content hashes, and safe fallback behavior.
+
 ## 0.3.0.0 - 2026-09-18
 
 - Add schema-v2 `optimization_surface` contracts while preserving schema-v1
