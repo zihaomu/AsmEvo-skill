@@ -103,7 +103,7 @@ class SkillLayoutTests(unittest.TestCase):
         root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         skill_version = (SKILL / "VERSION").read_text(encoding="utf-8").strip()
 
-        self.assertEqual(root_version, "0.3.0.0")
+        self.assertEqual(root_version, "0.4.0.0")
         self.assertEqual(skill_version, root_version)
         for script in (
             "controller.py",
