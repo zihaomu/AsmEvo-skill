@@ -55,6 +55,7 @@ class V2ToolTests(unittest.TestCase):
                 detected_arches=["gfx1151"],
                 optimization_surface="amdgcn_assembly",
                 tools=tools,
+                software_components={"rocm": "10.0", "llvm": "24"},
             )
             tools.pop("profiler")
             blocked = preflight.inspect(
@@ -72,6 +73,8 @@ class V2ToolTests(unittest.TestCase):
         self.assertTrue(ready["ready"])
         self.assertEqual(ready["schema_version"], 2)
         self.assertEqual(ready["optimization_surface"], "amdgcn_assembly")
+        self.assertEqual(ready["architecture"]["architecture_generation"], "RDNA 3.5")
+        self.assertEqual(ready["software_stack"]["declared_components"]["rocm"], "10.0")
         self.assertFalse(blocked["ready"])
         self.assertTrue(any("profiler" in failure for failure in blocked["failures"]))
 
@@ -95,6 +98,7 @@ class V2ToolTests(unittest.TestCase):
                 requested_tools=requested,
                 native_load=True,
                 binary_roundtrip=False,
+                declared_components={"rocm": "10.0", "profiler": "3.8"},
             )
             requested.pop("profiler")
             blocked = capability_probe.probe(
@@ -110,6 +114,11 @@ class V2ToolTests(unittest.TestCase):
         self.assertEqual(
             report["tools"]["assembler"]["sha256"],
             tool_digest,
+        )
+        self.assertEqual(report["architecture"]["architecture_family"], "RDNA")
+        self.assertEqual(report["architecture"]["architecture_generation"], "RDNA 4")
+        self.assertEqual(
+            report["software_stack"]["declared_components"]["profiler"], "3.8"
         )
         self.assertFalse(blocked["ready"])
         self.assertIn("missing tools: profiler", blocked["failures"])

@@ -34,6 +34,37 @@
       "uniqueItems": true
     },
     "tools": {"type": "object"},
+    "architecture": {
+      "type": ["object", "null"],
+      "properties": {
+        "target_arch": {"type": "string", "pattern": "^gfx[0-9a-z]+$"},
+        "mapping_status": {"enum": ["known", "unknown"]},
+        "architecture_family": {"type": ["string", "null"]},
+        "architecture_generation": {"type": ["string", "null"]},
+        "architecture_specific_guidance": {"type": "boolean"},
+        "knowledge_reference": {"type": ["string", "null"]},
+        "knowledge_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "registry": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "software_stack": {
+      "type": "object",
+      "required": [
+        "declared_components",
+        "observed_tools",
+        "compatibility_policy"
+      ],
+      "properties": {
+        "declared_components": {"type": "object"},
+        "observed_tools": {"type": "object"},
+        "compatibility_policy": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
     "features": {
       "type": "object",
       "required": [

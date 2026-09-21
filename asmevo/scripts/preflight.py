@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import target_context
 from backends import common as backend_common
 
 SOURCE_CAPABILITIES = set(backend_common.V2_SOURCE_CAPABILITIES)
@@ -86,6 +87,7 @@ def inspect(
     optimization_surface: str | None = None,
     tools: dict[str, str] | None = None,
     declared_features: dict[str, bool] | None = None,
+    software_components: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if mode not in {"source", "binary", "audit"}:
         raise PreflightInputError("mode must be source, binary, or audit")
@@ -288,6 +290,15 @@ def inspect(
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
     if optimization_surface is not None:
+        try:
+            architecture = (
+                target_context.resolve_architecture(normalized_target_arch)
+                if normalized_target_arch
+                else None
+            )
+            stack = target_context.software_stack(software_components, tool_identities)
+        except target_context.TargetContextError as error:
+            raise PreflightInputError(str(error)) from error
         report.update(
             {
                 "kind": "asmevo.capability-report.v2",
@@ -298,6 +309,8 @@ def inspect(
                 },
                 "features": computed_features,
                 "required_features": sorted(required_features),
+                "architecture": architecture,
+                "software_stack": stack,
             }
         )
     return report
@@ -310,6 +323,15 @@ def _parse_feature(raw: str) -> tuple[str, bool]:
     if not name or value.lower() not in {"true", "false"}:
         raise PreflightInputError(f"feature must be NAME=true|false: {raw}")
     return name, value.lower() == "true"
+
+
+def _parse_component(raw: str) -> tuple[str, str]:
+    if "=" not in raw:
+        raise PreflightInputError(f"component must be NAME=VERSION: {raw}")
+    name, value = (part.strip() for part in raw.split("=", 1))
+    if not name or not value:
+        raise PreflightInputError(f"component must be NAME=VERSION: {raw}")
+    return name, value
 
 
 def main() -> int:
@@ -329,6 +351,9 @@ def main() -> int:
         "--tool", action="append", default=[], metavar="NAME=EXECUTABLE"
     )
     parser.add_argument("--feature", action="append", default=[], metavar="NAME=BOOL")
+    parser.add_argument(
+        "--component", action="append", default=[], metavar="NAME=VERSION"
+    )
     parser.add_argument("--require-file", action="append", default=[], type=Path)
     parser.add_argument("--require-gpu", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -344,6 +369,9 @@ def main() -> int:
         features = dict(_parse_feature(raw) for raw in args.feature)
         if len(features) != len(args.feature):
             raise PreflightInputError("feature names must be unique")
+        components = dict(_parse_component(raw) for raw in args.component)
+        if len(components) != len(args.component):
+            raise PreflightInputError("software component names must be unique")
         report = inspect(
             mode=args.mode,
             artifact=args.artifact,
@@ -355,6 +383,7 @@ def main() -> int:
             optimization_surface=args.optimization_surface,
             tools=tools,
             declared_features=features,
+            software_components=components,
         )
     except (OSError, PreflightInputError) as error:
         print(

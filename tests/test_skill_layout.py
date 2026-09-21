@@ -26,6 +26,7 @@ class SkillLayoutTests(unittest.TestCase):
             "scripts/lineage.py",
             "scripts/preflight.py",
             "scripts/capability_probe.py",
+            "scripts/target_context.py",
             "scripts/assemble.py",
             "scripts/disassemble.py",
             "scripts/code_object_diff.py",
@@ -43,6 +44,10 @@ class SkillLayoutTests(unittest.TestCase):
             "references/failure-taxonomy.md",
             "references/optimization-playbook.md",
             "references/profiling-contract.md",
+            "references/architecture-and-rocm-context.md",
+            "references/architectures/rdna35.md",
+            "references/architectures/rdna4.md",
+            "references/architectures/cdna5.md",
             "assets/evaluation-template.json",
             "assets/contract-template.json",
             "assets/example-environment.json",
@@ -51,6 +56,7 @@ class SkillLayoutTests(unittest.TestCase):
             "assets/schemas/profile-evidence.schema.json",
             "assets/architectures/gfx11.json",
             "assets/architectures/gfx12.json",
+            "assets/architectures/targets.json",
         ]
         for relative in expected:
             with self.subTest(relative=relative):

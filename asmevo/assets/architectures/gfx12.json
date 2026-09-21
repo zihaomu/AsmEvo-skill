@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "family": "gfx12",
+  "family": "gfx12-prefix",
   "target_pattern": "^gfx12[0-9a-z]+$",
   "required_live_evidence": [
     "exact_target_arch",
@@ -12,5 +12,5 @@
   "wave_size_policy": "Read the final kernel descriptor; never infer wave32 or wave64 from the family name.",
   "code_object_policy": "Read the final ELF and loader support; never infer a code-object version from the family name.",
   "reference": "https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html",
-  "note": "Detection policy only; this file contains no host support claim or unmeasured tuning recommendation."
+  "note": "Detection policy only. This prefix spans RDNA 4 targets such as gfx1201 and the CDNA 5 gfx1250 target; resolve assets/architectures/targets.json by exact key before loading architecture guidance."
 }

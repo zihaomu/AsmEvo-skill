@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import target_context
 from backends import common
 
 TOOL_ROLES = {"compiler", "assembler", "linker", "objdump", "readobj", "profiler"}
@@ -81,6 +82,7 @@ def probe(
     requested_tools: dict[str, str],
     native_load: bool,
     binary_roundtrip: bool,
+    declared_components: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if optimization_surface not in common.OPTIMIZATION_SURFACES:
         raise ProbeError(f"unknown optimization surface: {optimization_surface}")
@@ -162,6 +164,14 @@ def probe(
             "controller; use audit_only until a metadata-aware backend exists"
         )
 
+    architecture = target_context.resolve_architecture(target_arch)
+    warnings: list[str] = []
+    if architecture["mapping_status"] == "unknown":
+        warnings.append(
+            f"no exact architecture mapping for {target_arch}; architecture-specific "
+            "guidance is disabled"
+        )
+
     return {
         "schema_version": 2,
         "kind": "asmevo.capability-report.v2",
@@ -174,6 +184,9 @@ def probe(
         "requested_optimization_surface": optimization_surface,
         "tools": tools,
         "features": features,
+        "architecture": architecture,
+        "software_stack": target_context.software_stack(declared_components, tools),
+        "warnings": warnings,
         "required_tools": sorted(required_tools),
         "required_features": sorted(required_features),
         "environment": {
@@ -194,6 +207,9 @@ def main() -> int:
         choices=tuple(sorted(common.OPTIMIZATION_SURFACES)),
     )
     parser.add_argument("--tool", action="append", default=[], metavar="ROLE=PATH")
+    parser.add_argument(
+        "--component", action="append", default=[], metavar="NAME=VERSION"
+    )
     parser.add_argument("--native-load", action="store_true")
     parser.add_argument("--binary-roundtrip", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -202,6 +218,9 @@ def main() -> int:
         tools = dict(_parse_mapping(value) for value in args.tool)
         if len(tools) != len(args.tool):
             raise ProbeError("tool roles must be unique")
+        components = dict(_parse_mapping(value) for value in args.component)
+        if len(components) != len(args.component):
+            raise ProbeError("software component names must be unique")
         report = probe(
             target_arch=args.target_arch,
             detected_arches=args.detected_arch,
@@ -209,8 +228,9 @@ def main() -> int:
             requested_tools=tools,
             native_load=args.native_load,
             binary_roundtrip=args.binary_roundtrip,
+            declared_components=components,
         )
-    except ProbeError as error:
+    except (ProbeError, target_context.TargetContextError) as error:
         print(json.dumps({"status": "input_invalid", "error": str(error)}))
         return 2
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
